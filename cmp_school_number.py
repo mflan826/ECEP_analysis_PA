@@ -68,32 +68,6 @@ def match_row(cells, idx, col_idx, school_df, district_df):
 
     return cells, col_idx['school_id'], school_id, col_idx['district_id'], district_id
 
-def populate_ids(output_path, district_source_path, school_source_path,
-                 output_name_col, id_col_to_fill,
-                 match_on_district=True):
-    # Load dataframes, skipping first 6 rows
-    output_df = pd.read_excel(output_path)
-    district_df = pd.read_excel(district_source_path, skiprows=6)
-    school_df = pd.read_excel(school_source_path, skiprows=6)
-
-    # Choose source and columns based on type of ID
-    if match_on_district:
-        source_df = district_df
-        name_col = elsi_district_col
-        id_col = elsi_district_id_col
-    else:
-        source_df = school_df
-        name_col = elsi_school_col
-        id_col = elsi_school_id_col
-
-    # Fill in the ID column
-    for idx, row in output_df.iterrows():
-        name_to_match = row[output_name_col]
-        matched_id = get_id_from_name(name_to_match, source_df, name_col, id_col)
-        output_df.at[idx, id_col_to_fill] = matched_id
-
-    return output_df
-
 # Load source Excel data (data starts on row 7 in the source files)
 district_df = pd.read_excel(elsi_district_file_name, skiprows=6)
 school_df = pd.read_excel(elsi_school_file_name, skiprows=6)
