@@ -5,8 +5,6 @@ import pandas as pd
 import openpyxl # pip install openpyxl
 from openpyxl import load_workbook
 
-conn = sqlite3.connect("imported_excel.db")
-
 # Load configuration from YAML
 with open('config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -15,6 +13,9 @@ school_year_dash = config['years']
 school_year_splat = [yr.replace('-', '_') for yr in school_year_dash]
 cmp_file_path_prefix = config['cmp_file_path_prefix']
 cmp_output_file = f"{cmp_file_path_prefix}/{config['cmp_output_file_name']}"
+db_file = f"{cmp_file_path_prefix}/{config['db_file_name']}"
+
+conn = sqlite3.connect(db_file)
 
 def clear_and_append_dataframes_to_excel(filepath, sheet_name, dataframes):
     """
@@ -96,7 +97,7 @@ for script in ['school_cs_jinja.sql', 'school_pop_jinja.sql']:
 
         # Save to CSV using pandas
         df = pd.DataFrame(results, columns=column_names)
-        df.to_csv(f"{script}-{splat}.csv", index=False)
+        #df.to_csv(f"{script}-{splat}.csv", index=False)
         
         if script == 'school_cs_jinja.sql':
             cs_dfs.append(df)

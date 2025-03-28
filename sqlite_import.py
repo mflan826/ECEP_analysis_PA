@@ -15,8 +15,8 @@ with open('config.yaml', 'r') as f:
 data_file_password = config['data_file_password']
 data_file_path_prefix = config['data_file_path_prefix']
 cmp_file_path_prefix = config['cmp_file_path_prefix']
-cmp_courses_file = cmp_file_path_prefix + "/Courses.xlsx"
-db_file = "imported_excel.db"
+cmp_courses_file = f"{cmp_file_path_prefix}/{config['cmp_courses_file_name']}"
+db_file = f"{cmp_file_path_prefix}/{config['db_file_name']}"
 
 def get_xlsx_files(directory_path):
     """
