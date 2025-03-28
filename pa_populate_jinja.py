@@ -1,6 +1,6 @@
 import sqlite3
 from jinja2 import Template
-import yaml  # pip install pyyaml
+import yaml
 import pandas as pd
 from openpyxl import load_workbook
 
@@ -11,14 +11,8 @@ with open('config.yaml', 'r') as f:
 school_year_dash = config['years']
 school_year_splat = [yr.replace('-', '_') for yr in school_year_dash]
 file_path_prefix = config['file_path_prefix']
-cmp_output_file = f"{file_path_prefix}/{config['cmp_output_file_name']}"
+pa_output_file = f"{file_path_prefix}/{config['pa_output_file_name']}"
 db_file = f"{file_path_prefix}/{config['db_file_name']}"
-
-# ELSI fields from config
-elsi_school_id_col = config['elsi_school_id_col']
-elsi_district_id_col = config['elsi_district_id_col']
-elsi_low_grade_band = config['elsi_low_grade_band']
-elsi_high_grade_band = config['elsi_high_grade_band']
 
 def clear_and_append_dataframes_to_excel(filepath, sheet_name, dataframes):
     try:
@@ -31,23 +25,17 @@ def clear_and_append_dataframes_to_excel(filepath, sheet_name, dataframes):
 
     sheet = book[sheet_name]
 
-    # Read existing header (row 1)
-    header = [cell.value for cell in sheet[1] if cell.value]
+    # Read existing header (row 2)
+    header = [cell.value for cell in sheet[2] if cell.value]
     if not header:
-        raise ValueError(f"No header found in row 1 of sheet '{sheet_name}'.")
-
-    # Log missing ELSI columns
-    expected_elsi = {elsi_school_id_col, elsi_district_id_col, elsi_low_grade_band, elsi_high_grade_band}
-    missing_elsi = expected_elsi - set(header)
-    if missing_elsi:
-        print(f"Note: Sheet '{sheet_name}' is missing ELSI columns and will not include: {sorted(missing_elsi)}")
+        raise ValueError(f"No header found in row 2 of sheet '{sheet_name}'.")
 
     # Clear all rows except the header
     max_row = sheet.max_row
-    if max_row > 1:
-        sheet.delete_rows(2, max_row - 1)
+    if max_row > 2:
+        sheet.delete_rows(3, max_row - 1)
 
-    start_row = 2
+    start_row = 3
 
     for i, df in enumerate(dataframes):
         df_cols = list(df.columns)
@@ -72,39 +60,46 @@ def clear_and_append_dataframes_to_excel(filepath, sheet_name, dataframes):
 
     book.save(filepath)
 
-cs_dfs = []
-pop_dfs = []
+# Prepare to store the results
+offerings_dfs = []
+school_list_dfs = []
 
+# Connect to SQLite
 conn = sqlite3.connect(db_file)
 
-for script in ['school_cs_jinja.sql', 'school_pop_jinja.sql']:
-    with open(script) as file:
+# SQL files and their corresponding output targets
+scripts = {
+    'pa_school_offerings_jinja.sql': offerings_dfs,
+    'pa_school_list_jinja.sql': school_list_dfs
+}
+
+for script_name, target_list in scripts.items():
+    with open(script_name, 'r') as file:
         template = Template(file.read())
 
     for i in range(len(school_year_dash)):
         dash = school_year_dash[i]
         splat = school_year_splat[i]
 
-        rendered_sql = template.render(school_year_dash=dash, school_year_splat=splat, high_school_only=True) # CMP is grades 9-12 only, so high_school_only = True
+        rendered_sql = template.render(
+            school_year_dash=dash,
+            school_year_splat=splat
+        )
 
         cursor = conn.cursor()
-        cursor.execute(rendered_sql)
-
-        results = cursor.fetchall()
-        column_names = [desc[0] for desc in cursor.description]
-
-        df = pd.DataFrame(results, columns=column_names)
-
-        if script == 'school_cs_jinja.sql':
-            cs_dfs.append(df)
-        elif script == 'school_pop_jinja.sql':
-            pop_dfs.append(df)
-        else:
-            print("Warning: No matching script array for appending the dataframe for writing.")
+        try:
+            cursor.execute(rendered_sql)
+            results = cursor.fetchall()
+            column_names = [desc[0] for desc in cursor.description]
+            df = pd.DataFrame(results, columns=column_names)
+            target_list.append(df)
+        except sqlite3.Error as e:
+            print(f"SQL error while executing {script_name} for {splat}: {e}")
 
 conn.close()
 
-clear_and_append_dataframes_to_excel(cmp_output_file, "School CS Data", cs_dfs)
-clear_and_append_dataframes_to_excel(cmp_output_file, "School Pop. Data", pop_dfs)
+# Write results to Excel
+clear_and_append_dataframes_to_excel(pa_output_file, "Tab 1 - School Offerings", offerings_dfs)
+clear_and_append_dataframes_to_excel(pa_output_file, "School list", school_list_dfs)
 
 print("Done.")

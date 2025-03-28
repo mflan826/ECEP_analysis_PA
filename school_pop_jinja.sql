@@ -1,21 +1,40 @@
-SELECT  
-    "23-24" AS "School Year",
-    LOCATION_ID, 
-    LOCATION_NAME AS "School Name", 
-    DISTRICT_NAME AS "District Name",
-    ENROLL,
-    CAST(ROUND(ENROLL * "AI/AN" / 100) AS INT) AS "Amer. Indian or Alaska Native", 
-    CAST(ROUND(ENROLL * "ASIAN" / 100) AS INT) AS "Asian",
-    CAST(ROUND(ENROLL * "BLK/AF_AMER" / 100) AS INT) AS "Black or African Amer.",
-    CAST(ROUND(ENROLL * "HISP" / 100) AS INT) AS "Hisp. or Latino",
-    CAST(ROUND(ENROLL * "NH/PI" / 100) AS INT) AS "Native Hawaiian or Pacific Islander",
-    CAST(ROUND(ENROLL * "MULTI-RACIAL" / 100) AS INT) AS "Two or more races",
-    CAST(ROUND(ENROLL * "WHITE" / 100) AS INT) AS "White",
-    CAST(ROUND(ENROLL * "F" / 100) AS INT) AS "Girls",
-    CAST(ROUND(ENROLL * "M" / 100) AS INT) AS "Boys",
-    CAST(ROUND(ENROLL * "PLAN_504" / 100) AS INT) AS "S504",
-    CAST(ROUND(ENROLL * ("SPL_ED" + "AUT" + "DEAF-BLIND" + "DEV DELAY" + "EMPTL DIST" + "GIFT-DIS" + "HI" + "INF-TOD" + "INTELL DIS" + "MULTI" + "ORTHO" + "SPEC LRN DIS" + "SPCH LANG" + "TBI" + "VI" + "OTHER") / 100) AS INT) AS "Disability",
-    CAST(ROUND(ENROLL * "ED" / 100) AS INT) AS "Eco. Dis.",
-    CAST(ROUND(ENROLL * "EL" / 100) AS INT) AS "EL"
-FROM 
-    "23_24_Student_School_Demographics";
+SELECT
+    '{{ school_year_dash }}' AS "School Year",
+    course.LOCATION_ID,
+    demographics.LOCATION_NAME AS "School Name",
+    demographics.DISTRICT_NAME AS "District Name",
+
+    demographics."School Number (NCES)" AS "School Number (NCES)",
+    demographics."District Number (NCES)" AS "District Number (NCES)",
+    demographics."Lowest Grade Level Served" AS "Lowest Grade Level Served",
+    demographics."Highest Grade Level Served" AS "Highest Grade Level Served",
+
+    COUNT(*) AS ENROLL,
+
+    COUNT(CASE WHEN course.RACE_ETH = 'AI/AN' THEN 1 END) AS "Amer. Indian or Alaska Native",
+    COUNT(CASE WHEN course.RACE_ETH = 'ASIAN' THEN 1 END) AS "Asian",
+    COUNT(CASE WHEN course.RACE_ETH = 'BLK/AF_AMER' THEN 1 END) AS "Black or African Amer.",
+    COUNT(CASE WHEN course.RACE_ETH = 'HISP' THEN 1 END) AS "Hisp. or Latino",
+    COUNT(CASE WHEN course.RACE_ETH = 'NH/PI' THEN 1 END) AS "Native Hawaiian or Pacific Islander",
+    COUNT(CASE WHEN course.RACE_ETH = 'MULTI_RACIAL' THEN 1 END) AS "Two or more races",
+    COUNT(CASE WHEN course.RACE_ETH = 'WHITE' THEN 1 END) AS "White",
+
+    COUNT(CASE WHEN course.STUDENT_GENDER_CD = 'F' THEN 1 END) AS "Girls",
+    COUNT(CASE WHEN course.STUDENT_GENDER_CD = 'M' THEN 1 END) AS "Boys",
+
+    COUNT(CASE WHEN course.PLAN_504 = 'Yes' THEN 1 END) AS "S504",
+
+    COUNT(CASE WHEN course.SPL_ED_STATUS = 'Y' OR course.PRIMARY_DISABIITY IS NOT NULL THEN 1 END) AS "Disability",
+
+    COUNT(CASE WHEN course.POVERTY_CODE = 'Y' OR course.HOMELESS_STATUS = 'Y' THEN 1 END) AS "Eco. Dis.",
+    COUNT(CASE WHEN course.EL_STATUS = 'Y' THEN 1 END) AS "EL"
+
+FROM "{{ school_year_splat }}_Student_Teacher_Course" AS course
+INNER JOIN "{{ school_year_splat }}_Student_School_Demographics" AS demographics
+    ON course.LOCATION_ID = demographics.LOCATION_ID
+
+{% if high_school_only %}
+WHERE course.CURR_GRADE_LVL IN ('009', '010', '011', '012') 
+{% endif %}
+
+GROUP BY course.LOCATION_ID;
