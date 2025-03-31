@@ -32,6 +32,7 @@ Also add these lines to `config.yaml`:
 
 ```
 cmp_output_file_name: CMP_Data_Populated.xlsx
+
 cmp_courses_file_name: Courses.xlsx
 
 elsi_school_file_name: ELSI_excel_export_6387876108154778256164.xlsx
