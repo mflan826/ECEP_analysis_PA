@@ -58,7 +58,8 @@ elsi_high_grade_band: "Highest Grade Offered [Public School] 2023-24"
 Also add these lines to `config.yaml`:
 
 ```
-pa_output_file_name: PA_Data_Populated.xlsx
+pa_school_output_file_name: PA_School_Data_Populated.xlsx
+pa_statewide_output_file_name: PA_Statewide_Data_Populated.xlsx
 ```
 
 ## Usage
@@ -72,4 +73,4 @@ Run `cmp_populate_jinja.py` script
 
 ### PA State code.org Report
 
-Run `pa_populate_jinja.py` script
+Run `pa_school_populate_jinja.py` script and `pa_statewide_populate_jinja.py` script

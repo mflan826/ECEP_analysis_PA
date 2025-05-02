@@ -12,7 +12,7 @@ with open('config.yaml', 'r') as f:
 school_year_dash = config['years']
 school_year_splat = [yr.replace('-', '_') for yr in school_year_dash]
 file_path_prefix = config['file_path_prefix']
-pa_output_file = f"{file_path_prefix}/{config['pa_output_file_name']}"
+pa_school_output_file_name = f"{file_path_prefix}/{config['pa_school_output_file_name']}"
 db_file = f"{file_path_prefix}/{config['db_file_name']}"
 
 def write_dataframes(filepath, sheet_name, dataframes, header_row=1, start_row=2):
@@ -166,7 +166,7 @@ for script_name, target_list in scripts.items():
 conn.close()
 
 # Write results to Excel
-write_dataframes(pa_output_file, "Tab 1 - School Offerings", offerings_dfs, header_row=2, start_row=3)
-write_dataframes(pa_output_file, "School list", school_list_dfs, header_row=2, start_row=3)
+write_dataframes(pa_school_output_file_name, "Tab 1 - School Offerings", offerings_dfs, header_row=2, start_row=3)
+write_dataframes(pa_school_output_file_name, "School list", school_list_dfs, header_row=2, start_row=3)
 
 print("Done.")
