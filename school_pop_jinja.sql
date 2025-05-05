@@ -16,7 +16,7 @@ SELECT
     COUNT(CASE WHEN course.RACE_ETH = 'BLK/AF_AMER' THEN 1 END) AS "Black or African Amer.",
     COUNT(CASE WHEN course.RACE_ETH = 'HISP' THEN 1 END) AS "Hisp. or Latino",
     COUNT(CASE WHEN course.RACE_ETH = 'NH/PI' THEN 1 END) AS "Native Hawaiian or Pacific Islander",
-    COUNT(CASE WHEN course.RACE_ETH = 'MULTI_RACIAL' THEN 1 END) AS "Two or more races",
+    COUNT(CASE WHEN course.RACE_ETH = 'MULTI-RACIAL' THEN 1 END) AS "Two or more races",
     COUNT(CASE WHEN course.RACE_ETH = 'WHITE' THEN 1 END) AS "White",
 
     COUNT(CASE WHEN course.STUDENT_GENDER_CD = 'F' THEN 1 END) AS "Girls",

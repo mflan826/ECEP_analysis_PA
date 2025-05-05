@@ -61,10 +61,10 @@ SELECT
   COUNT(CASE WHEN RACE_ETH = 'HISP' THEN 1 END) AS "Number of Students: Hispanic/Latino/ Latina",
   COUNT(CASE WHEN RACE_ETH = 'AI/AN' THEN 1 END) AS "Number of Students: Native American/Alaska Native",
   COUNT(CASE WHEN RACE_ETH = 'NH/PI' THEN 1 END) AS "Number of Students: Native Hawaiian/Other Pacific Islander",
-  COUNT(CASE WHEN RACE_ETH = 'MULTI_RACIAL' THEN 1 END) AS "Number of Students: Two or More Races",
+  COUNT(CASE WHEN RACE_ETH = 'MULTI-RACIAL' THEN 1 END) AS "Number of Students: Two or More Races",
   COUNT(CASE WHEN RACE_ETH IS NULL OR RACE_ETH = '' THEN 1 END) AS "Number of Students: Race/Ethnicity not reported",
-  COUNT(CASE WHEN POVERTY_CODE = 'Y' OR HOMELESS_STATUS = 'Y' THEN 1 END) AS "Number of Students: Qualify for Free and Reduced Lunch",
-  COUNT(CASE WHEN SPL_ED_STATUS = 'Y' OR PRIMARY_DISABIITY IS NOT NULL THEN 1 END) AS "Number of Students with IEPs under IDEA",
+  COUNT(CASE WHEN POVERTY_CODE = 'Y' THEN 1 END) AS "Number of Students: Qualify for Free and Reduced Lunch",
+  COUNT(CASE WHEN SPL_ED_STATUS = 'Y' THEN 1 END) AS "Number of Students with IEPs under IDEA",
   COUNT(CASE WHEN PLAN_504 = 'Yes' THEN 1 END) AS "Number of Students: Qualify for services under section 504 of the Rehabilitation Act",
   COUNT(CASE WHEN EL_STATUS = 'Y' THEN 1 END) AS "Number of Students: English language learner"
 FROM banded
