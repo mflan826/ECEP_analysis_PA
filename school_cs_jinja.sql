@@ -3,6 +3,8 @@ SELECT
    course.LOCATION_ID,
    demographics.LOCATION_NAME AS "School Name", 
    demographics.DISTRICT_NAME AS "District Name",
+   course.COURSE_CODE_ALT AS "Course ID",
+   course.PDECOURSENAME AS "Course Name",   
    demographics."School Number (NCES)" AS "School Number (NCES)",
    demographics."District Number (NCES)" AS "District Number (NCES)",
     
