@@ -68,4 +68,10 @@ WHERE course.CURR_GRADE_LVL IN ('009', '010', '011', '012')
 {% endif %}
 
 GROUP BY 
-   course.LOCATION_ID;
+   course.LOCATION_ID,
+   course.COURSE_CODE_ALT,
+   course.PDECOURSENAME,
+   demographics.LOCATION_NAME,
+   demographics.DISTRICT_NAME,
+   demographics."School Number (NCES)",
+   demographics."District Number (NCES)"
