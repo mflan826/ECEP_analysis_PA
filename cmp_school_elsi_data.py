@@ -52,44 +52,35 @@ def normalize_name(name):
     return name.strip()
 
 def get_id_from_name_cached(name, lookup, source_df, id_col, cache, low_band_col=None, high_band_col=None):
+    if not name or not isinstance(name, str):
+        return None, None, None
+
+    name = name.strip()
     if not name:
         return None, None, None
 
-    norm_name = normalize_name(name)
-
-    # Check the cache first
-    match_index = cache.get(norm_name)
-
-    # Fallback to lookup if not cached
-    if match_index is None:
-        match_index = lookup.get(norm_name)
-        if match_index is not None:
-            cache[norm_name] = match_index  # Cache it now
-
-    if match_index is not None:
-        row = source_df.loc[match_index]
+    # Fast-path cache check
+    if name in cache:
+        idx = cache[name]
+        row = source_df.loc[idx]
         return (
-            row[id_col],
-            row[low_band_col] if low_band_col else None,
-            row[high_band_col] if high_band_col else None
+            row.get(id_col, None),
+            row.get(low_band_col, None) if low_band_col else None,
+            row.get(high_band_col, None) if high_band_col else None
         )
 
-    # Fuzzy fallback if no match
-    choices = source_df[elsi_school_col if id_col == elsi_school_id_col else elsi_district_col].astype(str)
-    normalized_choices = choices.map(normalize_name).tolist()
-
-    best_match = process.extractOne(norm_name, normalized_choices,
-                                    scorer=fuzz.token_sort_ratio,
-                                    score_cutoff=70)
+    # Fuzzy match using raw names (no normalization)
+    choices = source_df[elsi_school_col if id_col == elsi_school_id_col else elsi_district_col].fillna("").tolist()
+    best_match = process.extractOne(name, choices, scorer=fuzz.token_sort_ratio, score_cutoff=60)
 
     if best_match:
-        _, _, fallback_idx = best_match
-        cache[norm_name] = fallback_idx
-        row = source_df.iloc[fallback_idx]
+        matched_name, score, index = best_match
+        cache[name] = index  # Save for future lookups
+        row = source_df.iloc[index]
         return (
-            row[id_col],
-            row[low_band_col] if low_band_col else None,
-            row[high_band_col] if high_band_col else None
+            row.get(id_col, None),
+            row.get(low_band_col, None) if low_band_col else None,
+            row.get(high_band_col, None) if high_band_col else None
         )
 
     return None, None, None
