@@ -71,6 +71,14 @@ Run `sqlite_import.py` script, then `cmp_school_elsi_data.py` data script
 
 Run `cmp_populate_jinja.py` script
 
+#### Post-Processing
+
+Run `cmp_school_elsi_schoolid_postprocess.py` to fuzzy match against the ELSI school data report for NCES codes.  These can be obtained from [https://nces.ed.gov/ccd/elsi/](https://nces.ed.gov/ccd/elsi/). 
+
+To match against Edna data, obtain `SchoolFastFacts_20232024.xlsx - School Fast Facts.csv` and run `python aun_to_nces.py SchoolFastFacts_20232024.xlsx\ -\ School\ Fast\ Facts.csv AUN Schl edna_output.csv`.  Then run `cmp_school_edna_schoolid_postprocess.py`.
+
+Both programs run against `CMP Data Template (long format)_PA.xlsx` and insert the NCES school and district code into the `School Pop. Data` and `School CS Data` tabs.
+
 ### PA State code.org Report
 
 Run `pa_school_populate_jinja.py` script and `pa_statewide_populate_jinja.py` script
