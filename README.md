@@ -77,7 +77,7 @@ Run `cmp_school_elsi_schoolid_postprocess.py` to fuzzy match against the ELSI sc
 
 To match against Edna data, obtain `SchoolFastFacts_20232024.xlsx - School Fast Facts.csv` and run `python aun_to_nces.py SchoolFastFacts_20232024.xlsx\ -\ School\ Fast\ Facts.csv AUN Schl edna_output.csv`.  Then run `cmp_school_edna_schoolid_postprocess.py`.
 
-Both programs run against `CMP Data Template (long format)_PA.xlsx` and insert the NCES school and district code into the `School Pop. Data` and `School CS Data` tabs.
+Both programs run against `CMP Data Template (long format)_PA.xlsx` and insert the NCES school and district code into the `School Pop. Data` and `School CS Data` tabs.  `aun_to_nces.py` just builds a cache of school mappings, which is filled in by the `cmp_school_edna_schoolid_postprocess.py` script, so in theory one could skip `aun_to_nces.py`.
 
 ### PA State code.org Report
 
