@@ -47,13 +47,7 @@ def build_header_map(ws):
     """Return dict: header_text -> 1-based column index, from the first row in a worksheet."""
     header_cells = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
     return {str(v): i + 1 for i, v in enumerate(header_cells) if v is not None}
-
-def make_pair_key(school: str, district: str) -> str:
-    """
-    Build a normalized composite key for (School Name, District Name).
-    """
-    return f"{norm(school)}||{norm(district)}"
-    
+   
 def _extract_one(query: str, choices: list[str]):
     """
     Backend-agnostic extractOne(query, choices) -> (best_match, score)
@@ -126,17 +120,71 @@ def _make_session() -> requests.Session:
         "Connection": "close",
     })
     orig = s.request
+    
     def wrapped(method, url, **kwargs):
         kwargs.setdefault("timeout", (10, 30))
         return orig(method, url, **kwargs)
+        
     s.request = wrapped
     return s
 
-def _normalize_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
 def _digits_only(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
+
+def _normalize_key(s: str) -> str:
+    # Lowercase + collapse spaces + strip; longer limit for safety
+    if not s:
+        return ""
+    s_norm = re.sub(r"\s+", " ", str(s)).strip().lower()
+    return s_norm[:120]
+
+def _pair_key(school: str, district: str) -> str:
+    return f"{_normalize_key(school)}||{_normalize_key(district)}"
+
+def _derive_district7_from_12(nces12: str) -> str:
+    d = _digits_only(nces12)
+    return d[:7] if len(d) >= 7 else ""
+            
+# Helper to dedupe-append a discovered web_row to edna_output.csv
+def _append_if_new(web_row: dict):
+    append_cols = [
+        "School Name",
+        "School/Branch",
+        "NCES Code",
+        "Detail URL",
+        "District Name",
+        "District NCES",
+        "NCES 12-digit (District+Branch)",
+    ]
+    for c in append_cols:
+        web_row.setdefault(c, "")
+    existing = pd.read_csv(OUTPUT_CSV_FILENAME, dtype=str).fillna("")
+
+    in_school   = _normalize_key(web_row["School Name"])
+    in_district = _normalize_key(web_row["District Name"])
+    in_code12   = _digits_only(web_row.get("NCES 12-digit (District+Branch)", "")) or _digits_only(web_row.get("NCES Code", ""))
+
+    def _row_sig(r):
+        return (
+            _normalize_key(r.get("School Name", "")),
+            _normalize_key(r.get("District Name", "")),
+            _digits_only(r.get("NCES 12-digit (District+Branch)", "")) or _digits_only(r.get("NCES Code", "")),
+        )
+    incoming_sig = (in_school, in_district, in_code12)
+    is_dup = any(_row_sig(r) == incoming_sig for _, r in existing.iterrows())
+
+    if not is_dup:
+        pd.DataFrame([web_row])[append_cols].to_csv(
+            OUTPUT_CSV_FILENAME, mode="a", index=False, header=False
+        )
+        print(f"[ONLINE] Appended new row to {OUTPUT_CSV_FILENAME}: "
+              f"{web_row['School Name']} / {web_row['District Name']}")
+    else:
+        print(f"[ONLINE] Skipped append; entry already exists for "
+              f"{web_row['School Name']} / {web_row['District Name']}")
+
+def _normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
 
 def _currentname_search_url(school_name: str) -> str:
     return CURRENTNAME_SEARCH_TEMPLATE.format(CURRENT=quote_plus((school_name or "").strip()))
@@ -611,57 +659,24 @@ def main():
             ["School Name", "District Name", "NCES 12-digit (District+Branch)"],
             "output.csv"
         )
+        # Build two maps: (School, District) -> 12-digit, and -> District 7-digit
+        # Only index rows that actually have a 12-digit so lookups are actionable.
+        rows12 = []
+        rowsDist7 = []
+        for _, r in lookup.iterrows():
+            k = _pair_key(r.get("School Name", ""), r.get("District Name", ""))
+            code12 = _digits_only(r.get("NCES 12-digit (District+Branch)", ""))
+            dist7_csv = _digits_only(r.get("District NCES", ""))
+            if code12:
+                rows12.append((k, code12))
+                # Prefer District NCES column if present; else derive from the 12-digit
+                rowsDist7.append((k, dist7_csv if len(dist7_csv) == 7 else _derive_district7_from_12(code12)))
 
-        # Composite (School, District) → NCES 12-digit map for exact and fuzzy
-        def _make_pair_key(s, d): 
-            return f"{norm(s)}||{norm(d)}"
-
-        pair_to_nces12 = dict(
-            zip(
-                (_make_pair_key(r["School Name"], r["District Name"]) for _, r in lookup.iterrows()),
-                lookup["NCES 12-digit (District+Branch)"].astype(str).map(norm)
-            )
-        )
-        csv_composite_keys = list(pair_to_nces12.keys())
+        pair_to_nces12 = dict(rows12)
+        pair_to_dist7  = dict(rowsDist7)
 
         # 2) Open workbook (preserves formatting/validations)
         wb = load_workbook(CMP_FILENAME)
-
-        # Helper to dedupe-append a discovered web_row to edna_output.csv
-        def _append_if_new(web_row: dict):
-            append_cols = [
-                "School Name",
-                "School/Branch",
-                "NCES Code",
-                "Detail URL",
-                "District Name",
-                "District NCES",
-                "NCES 12-digit (District+Branch)",
-            ]
-            for c in append_cols:
-                web_row.setdefault(c, "")
-            existing = pd.read_csv(OUTPUT_CSV_FILENAME, dtype=str).fillna("")
-            key_incoming = (
-                norm(web_row["School Name"]),
-                norm(web_row["District Name"]),
-                norm(web_row.get("NCES 12-digit (District+Branch)")) or norm(web_row.get("NCES Code"))
-            )
-            def _row_key(r):
-                return (
-                    norm(r.get("School Name", "")),
-                    norm(r.get("District Name", "")),
-                    norm(r.get("NCES 12-digit (District+Branch)", "")) or norm(r.get("NCES Code", ""))
-                )
-            is_dup = any(_row_key(r) == key_incoming for _, r in existing.iterrows())
-            if not is_dup:
-                pd.DataFrame([web_row])[append_cols].to_csv(
-                    OUTPUT_CSV_FILENAME, mode="a", index=False, header=False
-                )
-                print(f"[ONLINE] Appended new row to {OUTPUT_CSV_FILENAME}: "
-                      f"{web_row['School Name']} / {web_row['District Name']}")
-            else:
-                print(f"[ONLINE] Skipped append; entry already exists for "
-                      f"{web_row['School Name']} / {web_row['District Name']}")
 
         # 3) Process each sheet
         for sheet in CMP_SHEETS:
@@ -671,37 +686,43 @@ def main():
             df = pd.read_excel(CMP_FILENAME, sheet_name=sheet, dtype=str).fillna("")
             df.rename(columns=lambda c: c.strip() if isinstance(c, str) else c, inplace=True)
 
-            # Only the fields needed for lookup/writeback
+            # Ensure required columns and initialize writeback columns if missing
             ensure_headers(df, ["School Name", "District Name"], f"{sheet}")
             if "School Number (NCES)" not in df.columns:
                 df["School Number (NCES)"] = ""
+            if "District Number (NCES)" not in df.columns:
+                df["District Number (NCES)"] = ""
 
             # 4) Match each row
             for idx, row in tqdm(df.iterrows(), total=len(df), desc=f"Matching names in {sheet}"):
-                school = norm(row.get("School Name", ""))
-                district = norm(row.get("District Name", ""))
-
-                if not school or not district:
+                school = row.get("School Name", "")
+                district = row.get("District Name", "")
+                if not norm(school) or not norm(district):
                     print(f"[WARN] Missing School or District at row {idx+2} in '{sheet}'")
                     continue
 
-                key = f"{school}||{district}"
+                key = _pair_key(school, district)
 
                 # ---- Exact (local CSV) match on 12-digit
                 nces12 = pair_to_nces12.get(key, "")
                 if nces12:
-                    df.at[idx, "School Number (NCES)"] = nces12
+                    df.at[idx, "School Number (NCES)"]   = nces12
+                    # Prefer explicit district7 mapping; else derive from the 12-digit
+                    dist7 = pair_to_dist7.get(key, "") or _derive_district7_from_12(nces12)
+                    df.at[idx, "District Number (NCES)"] = dist7
                     continue
 
                 # No exact match: log and try online
                 print(f"[INFO] No exact match for row {idx+2} in '{sheet}': "
-                      f"School='{school}', District='{district}'")
+                      f"School='{norm(school)}', District='{norm(district)}'")
 
                 # ---- Online lookup on EDNA (by school name; require exact district)
-                web_row = edna_lookup_by_name(school, district, delay_sec=0.6)
+                web_row = edna_lookup_by_name(norm(school), norm(district), delay_sec=0.6)
                 if web_row and (web_row.get("NCES 12-digit (District+Branch)") or web_row.get("NCES Code")):
-                    chosen_nces = norm(web_row.get("NCES 12-digit (District+Branch)", "")) or norm(web_row.get("NCES Code", ""))
-                    df.at[idx, "School Number (NCES)"] = chosen_nces
+                    code12 = _digits_only(web_row.get("NCES 12-digit (District+Branch)", "")) or _digits_only(web_row.get("NCES Code", ""))
+                    dist7  = _digits_only(web_row.get("District NCES", "")) or _derive_district7_from_12(code12)
+                    df.at[idx, "School Number (NCES)"]   = code12
+                    df.at[idx, "District Number (NCES)"] = dist7
                     try:
                         _append_if_new(web_row)
                     except Exception as e:
@@ -719,17 +740,16 @@ def main():
                     row.get("School/Branch", ""),
                 ]
                 loc_raw = next((str(x) for x in loc_candidates if norm(x)), "")
-                loc_digits = re.sub(r"\D+", "", loc_raw or "")
+                loc_digits = _digits_only(loc_raw)
                 if loc_digits:
                     print(f"[INFO] Attempting location_id lookup for row {idx+2} "
                           f"in '{sheet}' using SchoolBranch={loc_digits.zfill(4)}")
                     web_row_loc = edna_lookup_by_location_id(loc_digits, delay_sec=0.6)
                     if web_row_loc and (web_row_loc.get("NCES 12-digit (District+Branch)") or web_row_loc.get("NCES Code")):
-                        chosen_nces = (
-                            norm(web_row_loc.get("NCES 12-digit (District+Branch)", "")) or
-                            norm(web_row_loc.get("NCES Code", ""))
-                        )
-                        df.at[idx, "School Number (NCES)"] = chosen_nces
+                        code12 = _digits_only(web_row_loc.get("NCES 12-digit (District+Branch)", "")) or _digits_only(web_row_loc.get("NCES Code", ""))
+                        dist7  = _digits_only(web_row_loc.get("District NCES", "")) or _derive_district7_from_12(code12)
+                        df.at[idx, "School Number (NCES)"]   = code12
+                        df.at[idx, "District Number (NCES)"] = dist7
                         try:
                             _append_if_new(web_row_loc)
                         except Exception as e:
@@ -737,29 +757,41 @@ def main():
                             traceback.print_exc()
                         continue
 
-                # ---- Optional fuzzy fallback
-                if ENABLE_FUZZY_MATCH and csv_composite_keys:
-                    best_match, score = _extract_one(key, csv_composite_keys)
+                # ---- Optional fuzzy fallback (kept as-is; only fills School Number)
+                # NOTE: If enabled and used, we also derive District Number from the chosen 12-digit.
+                if ENABLE_FUZZY_MATCH and pair_to_nces12:
+                    # Fuzzy over keys we have in CSV
+                    csv_keys = list(pair_to_nces12.keys())
+                    best_match, score = _extract_one(key, csv_keys)
                     if best_match and score >= FUZZY_THRESHOLD:
-                        df.at[idx, "School Number (NCES)"] = pair_to_nces12.get(best_match, "")
+                        code12 = pair_to_nces12.get(best_match, "")
+                        df.at[idx, "School Number (NCES)"]   = code12
+                        df.at[idx, "District Number (NCES)"] = pair_to_dist7.get(best_match, "") or _derive_district7_from_12(code12)
                         print(f"[FUZZY] Using fuzzy match (score {score:.1f}) → {best_match}")
                         continue
 
                 print(f"[WARN] No match found for row {idx+2} in '{sheet}': "
-                      f"School='{school}', District='{district}'")
+                      f"School='{norm(school)}', District='{norm(district)}'")
 
-            # 5) Write NCES back to THIS sheet now
+            # 5) Write NCES back to THIS sheet now (both School and District)
             ws = wb[sheet]
             header_to_col = build_header_map(ws)
             if "School Number (NCES)" not in header_to_col:
                 col_idx = len(header_to_col) + 1
                 ws.cell(row=1, column=col_idx, value="School Number (NCES)")
                 header_to_col["School Number (NCES)"] = col_idx
-            nces_col_idx = header_to_col["School Number (NCES)"]
+            if "District Number (NCES)" not in header_to_col:
+                col_idx = len(header_to_col) + 1
+                ws.cell(row=1, column=col_idx, value="District Number (NCES)")
+                header_to_col["District Number (NCES)"] = col_idx
+
+            nces_school_col   = header_to_col["School Number (NCES)"]
+            nces_district_col = header_to_col["District Number (NCES)"]
 
             for r in tqdm(range(len(df)), total=len(df), desc=f"Writing NCES in {sheet}", leave=False):
                 excel_row = r + 2
-                ws.cell(row=excel_row, column=nces_col_idx, value=df.iloc[r]["School Number (NCES)"])
+                ws.cell(row=excel_row, column=nces_school_col,   value=df.iloc[r]["School Number (NCES)"])
+                ws.cell(row=excel_row, column=nces_district_col, value=df.iloc[r]["District Number (NCES)"])
 
         # 6) Save updated workbook once after all sheets are written
         out_name = "CMP Data Template (long format)_PA - Updated.xlsx"
