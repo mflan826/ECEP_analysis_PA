@@ -451,15 +451,17 @@ def edna_lookup_district_by_name(session: requests.Session, lea_name: str, delay
 
 def edna_lookup_by_name(school_name: str, expected_district: str, delay_sec: float = 0.6) -> Optional[dict]:
     """
-    Online lookup by school name with exact district match.
-    Produces:
+    Online lookup by school name with exact district match (strict compare via _district_equals).
+    Returns a dict with fields aligned to edna_output.csv schema, or None if no verified match.
+
+    Produces (if resolvable):
       - 'NCES Code'    := school7 (7-digit) if present; else ''
       - 'District NCES': district7 (7-digit) if resolved; else ''
-      - 'NCES 12-digit (District+Branch)': district7 + school5 (derived from school7) if both parts are present; else ''
+      - 'NCES 12-digit (District+Branch)': district7 + school5 (derived from school7) if both parts present; else ''
+      - 'School/Branch': branch code (string) if present; else ''
+      - 'Detail URL'   : detail URL for the school, if direct-link path used; else ''
     IMPORTANT: Never use SchoolBranch/Location to compose the 12-digit.
     """
-    import re as _re
-
     school_name = norm(school_name)
     expected_district = norm(expected_district)
     if not school_name:
@@ -469,19 +471,67 @@ def edna_lookup_by_name(school_name: str, expected_district: str, delay_sec: flo
     try:
         candidates, search_url = _search_currentname(session, school_name)
     except Exception as e:
-        print(f"[online-lookup] fetch search failed for '{school_name}': {e}")
+        print(f"[online-lookup][name] fetch search failed for '{school_name}': {e}")
+        traceback.print_exc()
         return None
 
     if not candidates:
-        print(f"[online-lookup] no candidates for '{school_name}'")
+        print(f"[online-lookup][name] no candidates for '{school_name}'")
         return None
 
     for i, (inst_name, branch, href) in enumerate(candidates, start=1):
+        # Require Institution Name === school_name (strict-normalized)
+        if _normalize_strict(inst_name) != _normalize_strict(school_name):
+            continue
+
         try:
             time.sleep(delay_sec)
             detail_soup, detail_url_for_csv = _fetch_detail_soup(session, search_url, href)
         except Exception as e:
-            print(f"[online-lookup] candidate #{i} detail fetch failed: {e}")
+            print(f"[online-lookup][name] candidate #{i} detail fetch failed: {e}")
+            traceback.print_exc()
+            continue
+        if not detail_soup:
+            print(f"[online-lookup][name] candidate #{i} detail soup empty")
+            continue
+
+        # Extract school NCES (7-digit) and district name from the school page
+        school7 = _extract_school_nces7_from_details(detail_soup) or ""
+        district_name = _extract_district_name_from_details(detail_soup) or ""
+
+        # District must match the expected district strictly
+        if not _district_equals(district_name, expected_district):
+            print(f"[online-lookup][name] skip candidate #{i}: district mismatch "
+                  f"(saw '{district_name}' vs expected '{expected_district}')")
+            continue
+
+        # Resolve district NCES (7-digit) from the district (LEA) page
+        district7, district_detail_url = edna_lookup_district_by_name(session, district_name, delay_sec)
+
+        # Compose strictly from district7 + school5 (if both present)
+        school5 = _school7_to_school5(school7) if school7 else ""
+        nces12 = f"{district7}{school5}" if (len(district7) == 7 and len(school5) == 5) else ""
+
+        if not (school7 or nces12):
+            print(f"[online-lookup][name] skip candidate #{i} '{inst_name}': no usable NCES parts "
+                  f"(district7='{district7 or '—'}', school7='{school7 or '—'}')")
+            continue
+
+        row = {
+            "School Name": inst_name,
+            "School/Branch": f'="{branch}"' if branch else "",
+            "NCES Code": f'="{school7}"' if school7 else "",
+            "Detail URL": detail_url_for_csv,
+            "District Name": district_name,
+            "District NCES": f'="{district7}"' if district7 else "",
+            "NCES 12-digit (District+Branch)": f'="{nces12}"' if nces12 else "",
+        }
+        print(f"[ONLINE][name] accepted: {inst_name} "
+              f"(school7: {school7 or '—'}, district7: {district7 or '—'}, 12-digit: {nces12 or '—'})")
+        return row
+
+    print(f"[online-lookup][name] no verified candidate for '{school_name}' in district '{expected_district}'")
+    return None
 
 def edna_lookup_by_location_id(location_id: str, delay_sec: float = 0.6) -> Optional[dict]:
     """
@@ -650,7 +700,7 @@ def main():
                 # ---- Online lookup on EDNA (by school name; require exact district)
                 web_row = edna_lookup_by_name(school, district, delay_sec=0.6)
                 if web_row and (web_row.get("NCES 12-digit (District+Branch)") or web_row.get("NCES Code")):
-                    chosen_nces = norm(web_row.get("NCES 12-digit (District+Branch)", ""))
+                    chosen_nces = norm(web_row.get("NCES 12-digit (District+Branch)", "")) or norm(web_row.get("NCES Code", ""))
                     df.at[idx, "School Number (NCES)"] = chosen_nces
                     try:
                         _append_if_new(web_row)
@@ -659,8 +709,7 @@ def main():
                         traceback.print_exc()
                     continue
 
-                # ---- NEW: Online fallback by LOCATION_ID (EDNA SchoolBranch)
-                # Look for a plausible location_id in common columns
+                # ---- Fallback by LOCATION_ID (EDNA SchoolBranch)
                 loc_candidates = [
                     row.get("LOCATION_ID", ""),
                     row.get("Location ID", ""),
@@ -673,7 +722,7 @@ def main():
                 loc_digits = re.sub(r"\D+", "", loc_raw or "")
                 if loc_digits:
                     print(f"[INFO] Attempting location_id lookup for row {idx+2} "
-                          f"in '{sheet}' using SchoolBranch={loc_digits.zfill(4)}")                    
+                          f"in '{sheet}' using SchoolBranch={loc_digits.zfill(4)}")
                     web_row_loc = edna_lookup_by_location_id(loc_digits, delay_sec=0.6)
                     if web_row_loc and (web_row_loc.get("NCES 12-digit (District+Branch)") or web_row_loc.get("NCES Code")):
                         chosen_nces = (
@@ -688,7 +737,7 @@ def main():
                             traceback.print_exc()
                         continue
 
-                # ---- Fuzzy fallback (only if all online lookups failed)
+                # ---- Optional fuzzy fallback
                 if ENABLE_FUZZY_MATCH and csv_composite_keys:
                     best_match, score = _extract_one(key, csv_composite_keys)
                     if best_match and score >= FUZZY_THRESHOLD:
@@ -696,24 +745,23 @@ def main():
                         print(f"[FUZZY] Using fuzzy match (score {score:.1f}) → {best_match}")
                         continue
 
-                # If here, every option failed
                 print(f"[WARN] No match found for row {idx+2} in '{sheet}': "
                       f"School='{school}', District='{district}'")
 
-        # 5) Write NCES back via openpyxl
-        ws = wb[sheet]
-        header_to_col = build_header_map(ws)
-        if "School Number (NCES)" not in header_to_col:
-            col_idx = len(header_to_col) + 1
-            ws.cell(row=1, column=col_idx, value="School Number (NCES)")
-            header_to_col["School Number (NCES)"] = col_idx
-        nces_col_idx = header_to_col["School Number (NCES)"]
+            # 5) Write NCES back to THIS sheet now
+            ws = wb[sheet]
+            header_to_col = build_header_map(ws)
+            if "School Number (NCES)" not in header_to_col:
+                col_idx = len(header_to_col) + 1
+                ws.cell(row=1, column=col_idx, value="School Number (NCES)")
+                header_to_col["School Number (NCES)"] = col_idx
+            nces_col_idx = header_to_col["School Number (NCES)"]
 
-        for r in tqdm(range(len(df)), total=len(df), desc=f"Writing NCES in {sheet}", leave=False):
-            excel_row = r + 2
-            ws.cell(row=excel_row, column=nces_col_idx, value=df.iloc[r]["School Number (NCES)"])
+            for r in tqdm(range(len(df)), total=len(df), desc=f"Writing NCES in {sheet}", leave=False):
+                excel_row = r + 2
+                ws.cell(row=excel_row, column=nces_col_idx, value=df.iloc[r]["School Number (NCES)"])
 
-        # 6) Save updated workbook
+        # 6) Save updated workbook once after all sheets are written
         out_name = "CMP Data Template (long format)_PA - Updated.xlsx"
         wb.save(out_name)
         print(f"File saved as '{out_name}'")
