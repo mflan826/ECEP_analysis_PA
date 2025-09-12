@@ -108,7 +108,7 @@ SCHOOLBRANCH_SEARCH_TEMPLATE = (
 
 def _schoolbranch_search_url(branch_code: str) -> str:
     branch_code = (branch_code or "").strip()
-    branch_code = re.sub(r"\\D+", "", branch_code)
+    branch_code = re.sub(r"\D+", "", branch_code) 
     branch_code = branch_code.zfill(4) if branch_code else ""
     return SCHOOLBRANCH_SEARCH_TEMPLATE.format(BRANCH=quote_plus(branch_code))
 
@@ -125,7 +125,15 @@ def _search_schoolbranch(session: requests.Session, branch_code: str) -> Tuple[L
         return [], url
     return _iter_institution_links(table, inst_idx, branch_idx), url
 
-POSTBACK_RE = re.compile(r"""^javascript:\s*__doPostBack\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)\s*;?\s*$""")
+# Matches ONLY "javascript:__doPostBack(...)" exactly (keep if you still need it)
+POSTBACK_RE = re.compile(
+    r"""^javascript:\s*__doPostBack\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)\s*;?\s*$"""
+)
+
+# NEW: matches ANY occurrence of __doPostBack('...','...') inside href/onclick/etc.
+POSTBACK_ANY_RE = re.compile(
+    r"""__doPostBack\(\s*'(?P<target>[^']+)'\s*,\s*'(?P<arg>[^']*)'\s*\)"""
+)
 
 def _make_session() -> requests.Session:
     s = requests.Session()
@@ -240,10 +248,23 @@ def _currentname_search_url(school_name: str) -> str:
     return CURRENTNAME_SEARCH_TEMPLATE.format(CURRENT=quote_plus((school_name or "").strip()))
 
 def _parse_postback_href(href: str) -> Optional[Tuple[str, str]]:
-    if not href: return None
-    m = POSTBACK_RE.match(href.strip())
-    if not m: return None
-    return html.unescape(m.group(1)), html.unescape(m.group(2))
+    """
+    Parse an ASP.NET __doPostBack(...) from either a strict javascript: href
+    or from an onclick (or any attribute) that merely contains the call.
+    Returns (target, argument) or None.
+    """
+    if not href:
+        return None
+    val = href.strip()
+    # Strict: javascript:__doPostBack('...','...')
+    m = POSTBACK_RE.match(val)
+    if m:
+        return html.unescape(m.group(1)), html.unescape(m.group(2))
+    # Flexible: find __doPostBack(...) anywhere (works for onclick handlers too)
+    m2 = POSTBACK_ANY_RE.search(val)
+    if m2:
+        return html.unescape(m2.group("target")), html.unescape(m2.group("arg"))
+    return None
 
 def _collect_form_fields(form_tag: Tag) -> dict:
     data = {}
@@ -416,13 +437,6 @@ def _extract_kv_from_all_tables(soup: BeautifulSoup) -> dict:
     return kv
 
 # ---------- Rewritten getters using the kv-dict ----------
-def _extract_nces_code_from_details(soup: BeautifulSoup) -> str:
-    kv = _extract_kv_from_all_tables(soup)
-    for label in ("NCES Code", "School NCES", "NCES School Code"):
-        if kv.get(label):
-            return _normalize_space(kv[label])
-    return ""
-
 def _school7_to_school5(school7: str) -> str:
     """
     Convert a 7-digit school NCES to the 5-digit 'SCH' component:
@@ -432,8 +446,7 @@ def _school7_to_school5(school7: str) -> str:
     If (after stripping non-digits) the string is empty, return ''.
     If the nonzero part still exceeds 5 (unexpected), take the last 5 and log a breadcrumb.
     """
-    import re as _re
-    digits = _re.sub(r"\D+", "", school7 or "")
+    digits = re.sub(r"\D+", "", school7 or "")
     if not digits:
         return ""
     # Remove leading zeros; this implements “removing leading 0s … to go from n>5 like 7 to 5”
@@ -455,12 +468,10 @@ def _extract_school_nces7_from_details(soup: BeautifulSoup) -> str:
       3) Proximity regex: a 7-digit number within ±100 chars of 'NCES'
     Only a *7-digit* sequence is returned from here.
     """
-    import re as _re
-
     def _first_7(s: str) -> str:
         if not s:
             return ""
-        m = _re.search(r"\b\d{7}\b", s)
+        m = re.search(r"\b\d{7}\b", s)
         return m.group(0) if m else ""
 
     # 1) KV-style scan
@@ -479,7 +490,7 @@ def _extract_school_nces7_from_details(soup: BeautifulSoup) -> str:
 
     # 3) Regex proximity to 'NCES'
     text = soup.get_text(" ", strip=True)
-    for m in _re.finditer(r"\b\d{7}\b", text):
+    for m in re.finditer(r"\b\d{7}\b", text):
         start, end = m.start(), m.end()
         window = text[max(0, start-100):min(len(text), end+100)].lower()
         if "nces" in window:
@@ -496,10 +507,6 @@ def _extract_district_name_from_details(soup: BeautifulSoup) -> str:
         if kv.get(label):
             return _normalize_space(kv[label])
     return ""
-
-def _extract_branch_from_details(soup: BeautifulSoup) -> str:
-    kv = _extract_kv_from_all_tables(soup)
-    return _digits_only(kv.get("Branch", ""))
 
 def _extract_district_nces_from_details(soup: BeautifulSoup) -> str:
     """
@@ -684,8 +691,6 @@ def edna_lookup_by_location_id(location_id: str, delay_sec: float = 0.6) -> Opti
     Produces the same fields as the name-based path.
     IMPORTANT: Never use SchoolBranch/Location to compose the 12-digit.
     """
-    import re as _re
-
     loc = _digits_only(location_id).zfill(4)
     if not loc or len(loc) != 4:
         return None
@@ -755,6 +760,16 @@ def _debug_dump_html_snippet(soup: BeautifulSoup, tag: str = "schools"):
     except Exception:
         pass
 
+def _debug_dump_pager(schools_soup):
+    pager = schools_soup.find(
+        lambda t: t and t.name in ("div","td","span","ul","nav")
+        and (("page" in (t.get("class") or [])) or ("Page size:" in t.get_text(" ", strip=True)))
+    )
+    if pager:
+        print(str(pager)[:1000])
+    else:
+        print("[debug] pager not found")  
+    
 def _ensure_csv_with_headers(path: str, cols: list[str]):
     """Create CSV with given columns if it doesn't exist."""
     if not os.path.exists(path):
@@ -766,10 +781,7 @@ def _append_row_to_csv(path: str, cols: list[str], row: dict):
     pd.DataFrame([row])[cols].to_csv(path, mode="a", index=False, header=False)
 
 def _ensure_output_csv_exists():
-    """
-    Guarantee that edna_output.csv exists with the proper columns.
-    Also create a live stream mirror at output_edna.csv.
-    """
+    """Guarantee that edna_output.csv exists with the proper columns."""
     cols = [
         "School Name",
         "School/Branch",
@@ -1059,25 +1071,187 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
 
     return results
 
-def _paginate_next(session: requests.Session, current_url: str, current_soup: BeautifulSoup) -> Optional[tuple[BeautifulSoup, str]]:
+def _detect_current_page_num(pager_root: Tag) -> int:
     """
-    If a 'Next' link exists on the page (typical ASP.NET pager), click it and return (soup, url_or_referrer).
-    Returns None when there is no next page.
+    Try to detect the *current* page number from a pager area.
+    Common WebForms pattern: the current page is rendered as a plain <span> '1'
+    while other pages are <a> with __doPostBack('...','Page$N').
+    Returns an integer >=1 if found, else 0.
     """
-    # Most EDNA grids show 'Next' exactly; be forgiving on whitespace/case.
-    next_link = None
-    for a in current_soup.find_all("a", href=True):
-        txt = _normalize_space(a.get_text(" ", strip=True)).lower()
-        if txt == "next" or txt == "next >" or txt == ">":
-            next_link = a
-            break
-    if not next_link:
+    try:
+        # Look for a bare number inside a <span> with neighboring numeric links
+        for sp in pager_root.find_all("span"):
+            txt = _normalize_space(sp.get_text(" ", strip=True))
+            if re.fullmatch(r"\d+", txt):
+                # Heuristic: if siblings include any link to Page$<num>, treat this as current
+                sib_text = " ".join(a.get_text(" ", strip=True) for a in pager_root.find_all("a"))
+                if re.search(r"\b\d+\b", sib_text):
+                    return int(txt)
+    except Exception:
+        traceback.print_exc()
+    return 0
+
+
+def _paginate_next(session: requests.Session,
+                   current_url: str,
+                   current_soup: BeautifulSoup) -> Optional[tuple[BeautifulSoup, str]]:
+    """
+    Navigate to the *next* page of a WebForms GridView-style pager.
+    Handles:
+      • LinkButtons that call __doPostBack('target','Page$Next') in href or onclick
+      • Numeric paging: __doPostBack('target','Page$N') with a <span>N</span> as current
+      • True <a href="…"> links (rare on this site)
+    Returns (next_soup, referrer_url) or None if no next page is available.
+    """
+    try:
+        # 0) Fast path: literal "Next" anchor (visible text)
+        for a in current_soup.find_all("a", href=True):
+            label = _normalize_space(a.get_text(" ", strip=True)).lower()
+            if label in {"next", "next >", ">", "›", "»"}:
+                soup2 = _click_link_or_postback(session, current_url, a)
+                return (soup2, current_url) if soup2 else None
+
+        # 1) Scan all potential clickables for __doPostBack
+        target_next = None
+        arg_next = None
+        numeric_candidates: list[tuple[int, str, str, Tag]] = []  # (page_num, target, arg, tag)
+
+        def consider_element(tag: Tag):
+            nonlocal target_next, arg_next, numeric_candidates
+            # Check both href and onclick (onclick often holds the postback)
+            for attr in ("href", "onclick"):
+                val = (tag.get(attr) or "").strip()
+                if not val:
+                    continue
+
+                # Try strict "javascript:__doPostBack(…)" first
+                m = POSTBACK_RE.match(val)
+                if not m:
+                    # Fall back to broad "…__doPostBack('t','a')…" search (handles onclick)
+                    m2 = POSTBACK_ANY_RE.search(val)
+                    if not m2:
+                        continue
+                    tgt, arg = html.unescape(m2.group("target")), html.unescape(m2.group("arg"))
+                else:
+                    tgt, arg = html.unescape(m.group(1)), html.unescape(m.group(2))
+
+                if arg == "Page$Next":
+                    target_next, arg_next = tgt, arg
+                    return
+
+                mn = re.match(r"^Page\$(\d+)$", arg)
+                if mn:
+                    try:
+                        numeric_candidates.append((int(mn.group(1)), tgt, arg, tag))
+                    except Exception:
+                        pass
+
+        for tag in current_soup.find_all(["a", "button", "span", "input"]):
+            consider_element(tag)
+            if target_next and arg_next:
+                break
+
+        # 2) Explicit Next
+        if target_next and arg_next:
+            soup2 = _do_postback(session, current_url, target_next, arg_next)
+            return (soup2, current_url) if soup2 else None
+
+        # 3) Numeric paging: choose current+1 if we can detect the current page
+        if numeric_candidates:
+            # Find a likely pager root by intersecting ancestors (best-effort)
+            pager_root = None
+            try:
+                parents = []
+                for _, _, _, tag in numeric_candidates[:6]:
+                    chain = []
+                    p = tag
+                    while p:
+                        chain.append(p)
+                        p = p.parent
+                    parents.append(chain)
+                common = []
+                for cols in zip(*map(reversed, parents)):
+                    if all(x is cols[0] for x in cols):
+                        common.append(cols[0])
+                    else:
+                        break
+                pager_root = common[-1] if common else None
+            except Exception:
+                traceback.print_exc()
+
+            pager_root = pager_root or current_soup
+            cur = _detect_current_page_num(pager_root)
+            if cur > 0:
+                for page_num, tgt, arg, _ in sorted(numeric_candidates, key=lambda t: t[0]):
+                    if page_num == cur + 1:
+                        soup2 = _do_postback(session, current_url, tgt, arg)
+                        return (soup2, current_url) if soup2 else None
+
+            # Fallback: pick the smallest numeric candidate ≥ 2
+            for page_num, tgt, arg, _ in sorted(numeric_candidates, key=lambda t: t[0]):
+                if page_num >= 2:
+                    soup2 = _do_postback(session, current_url, tgt, arg)
+                    return (soup2, current_url) if soup2 else None
+
+        # 4) ARIA/title hints (e.g., right-arrow without text)
+        for tag in current_soup.find_all(True):
+            labelled = (_normalize_space(tag.get("aria-label", "")) + " " +
+                        _normalize_space(tag.get("title", ""))).lower()
+            if any(k in labelled for k in ("next", "right", "forward")):
+                for attr in ("href", "onclick"):
+                    val = (tag.get(attr) or "").strip()
+                    if not val:
+                        continue
+                    m = POSTBACK_ANY_RE.search(val) or POSTBACK_RE.match(val)
+                    if m:
+                        if hasattr(m, "groupdict") and "target" in m.groupdict():
+                            tgt, arg = html.unescape(m.group("target")), html.unescape(m.group("arg"))
+                        else:
+                            tgt, arg = html.unescape(m.group(1)), html.unescape(m.group(2))
+                        soup2 = _do_postback(session, current_url, tgt, arg)
+                        return (soup2, current_url) if soup2 else None
+
+        # 5) Probably last page
         return None
 
-    soup2 = _click_link_or_postback(session, current_url, next_link)
-    if not soup2:
+    except Exception as e:
+        print(f"[_paginate_next] {e}")
+        traceback.print_exc()
         return None
-    return soup2, current_url
+
+def _paginate_goto(session: requests.Session,
+                   current_url: str,
+                   current_soup: BeautifulSoup,
+                   page_number: int) -> Optional[tuple[BeautifulSoup, str]]:
+    """
+    Jump directly to Page$<page_number> if that postback exists
+    (handles both href="javascript:..." and onclick="return __doPostBack(...)").
+    """
+    try:
+        arg_want = f"Page${page_number}"
+        for tag in current_soup.find_all(["a", "button", "span", "input"]):
+            for attr in ("href", "onclick"):
+                val = (tag.get(attr) or "").strip()
+                if not val:
+                    continue
+
+                m = POSTBACK_RE.match(val)
+                if not m:
+                    m2 = POSTBACK_ANY_RE.search(val)
+                    if not m2:
+                        continue
+                    tgt, arg = html.unescape(m2.group("target")), html.unescape(m2.group("arg"))
+                else:
+                    tgt, arg = html.unescape(m.group(1)), html.unescape(m.group(2))
+
+                if arg == arg_want:
+                    soup2 = _do_postback(session, current_url, tgt, arg)  # <- fixed name
+                    return (soup2, current_url) if soup2 else None
+        return None
+    except Exception as e:
+        print(f"[_paginate_goto] {e}")
+        traceback.print_exc()
+        return None
 
 def _open_schools_branches_direct(session: requests.Session,
                                   detail_soup: BeautifulSoup,
@@ -1306,31 +1480,8 @@ def prepopulate_edna_from_districts(xlsx_path: str, sheets: list[str], delay_sec
 # ==============================
 def main():
     try:
-        # 1) Load lookup table from edna_output.csv (stable headers)
         # Ensure output file exists before reading
         _ensure_output_csv_exists()
-        
-        lookup = pd.read_csv(OUTPUT_CSV_FILENAME, dtype=str).fillna("")
-        ensure_headers(
-            lookup,
-            ["School Name", "District Name", "NCES 12-digit (District+Branch)"],
-            "output.csv"
-        )
-        # Build two maps: (School, District) -> 12-digit, and -> District 7-digit
-        # Only index rows that actually have a 12-digit so lookups are actionable.
-        rows12 = []
-        rowsDist7 = []
-        for _, r in lookup.iterrows():
-            k = _pair_key(r.get("School Name", ""), r.get("District Name", ""))
-            code12 = _digits_only(r.get("NCES 12-digit (District+Branch)", ""))
-            dist7_csv = _digits_only(r.get("District NCES", ""))
-            if code12:
-                rows12.append((k, code12))
-                # Prefer District NCES column if present; else derive from the 12-digit
-                rowsDist7.append((k, dist7_csv if len(dist7_csv) == 7 else _derive_district7_from_12(code12)))
-
-        pair_to_nces12 = dict(rows12)
-        pair_to_dist7  = dict(rowsDist7)
 
         # 2) Open workbook (preserves formatting/validations)
         wb = load_workbook(CMP_FILENAME)
@@ -1341,6 +1492,25 @@ def main():
         except Exception as e:
             print(f"[district-prep] {e}")
             traceback.print_exc()
+
+        # RELOAD LOOKUP *after* prepopulation
+        lookup = pd.read_csv(OUTPUT_CSV_FILENAME, dtype=str).fillna("")
+        ensure_headers(
+            lookup,
+            ["School Name", "District Name", "NCES 12-digit (District+Branch)"],
+            "output.csv"
+        )
+        rows12, rowsDist7 = [], []
+        for _, r in lookup.iterrows():
+            k = _pair_key(r.get("School Name",""), r.get("District Name",""))
+            code12 = _digits_only(r.get("NCES 12-digit (District+Branch)",""))
+            dist7_csv = _digits_only(r.get("District NCES",""))
+            if code12:
+                rows12.append((k, code12))
+                rowsDist7.append((k, dist7_csv if len(dist7_csv)==7 else _derive_district7_from_12(code12)))
+
+        pair_to_nces12 = dict(rows12)
+        pair_to_dist7  = dict(rowsDist7)
 
         # 3) Process each sheet
         for sheet in CMP_SHEETS:
@@ -1440,6 +1610,7 @@ def main():
             # 5) Write NCES back to THIS sheet now (both School and District)
             ws = wb[sheet]
             header_to_col = build_header_map(ws)
+
             if "School Number (NCES)" not in header_to_col:
                 col_idx = len(header_to_col) + 1
                 ws.cell(row=1, column=col_idx, value="School Number (NCES)")
@@ -1452,6 +1623,12 @@ def main():
             nces_school_col   = header_to_col["School Number (NCES)"]
             nces_district_col = header_to_col["District Number (NCES)"]
 
+            # Ensure Excel treats these as text (preserve leading zeros)
+            for col_idx in (nces_school_col, nces_district_col):
+                for r in range(2, len(df) + 2):
+                    ws.cell(row=r, column=col_idx).number_format = "@"
+
+            # Write values
             for r in tqdm(range(len(df)), total=len(df), desc=f"Writing NCES in {sheet}", leave=False):
                 excel_row = r + 2
                 ws.cell(row=excel_row, column=nces_school_col,   value=df.iloc[r]["School Number (NCES)"])
