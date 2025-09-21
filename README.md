@@ -51,6 +51,8 @@ elsi_school_id_col: "School ID (12-digit) - NCES Assigned [Public School] Latest
 elsi_district_id_col: "Agency ID - NCES Assigned [District] Latest available year"
 elsi_low_grade_band: "Lowest Grade Offered [Public School] 2023-24"
 elsi_high_grade_band: "Highest Grade Offered [Public School] 2023-24"
+
+edna_cache: "edna_output.csv"
 ```
 
 ### PA (code.org)
@@ -65,19 +67,26 @@ pa_statewide_output_file_name: PA_Statewide_Data_Populated.xlsx
 ## Usage
 
 ### Initial Setup and Data Import
-Run `sqlite_import.py` script, then `cmp_school_elsi_data.py` data script
+Run the `sqlite_import.py` script.
+
+### Augment with External Data Reports
+
+1. ELSI Data: Obtain ELSI NCES code data from [https://nces.ed.gov/ccd/elsi/](https://nces.ed.gov/ccd/elsi/)
+2. School Fast Facts (PA AUN Numbers): obtain `SchoolFastFacts_20232024.xlsx - School Fast Facts.csv`
+3. Run `python aun_to_nces.py SchoolFastFacts_20232024.xlsx\ -\ School\ Fast\ Facts.csv AUN Schl` to pre-populate the edna school data cache
+
+#### Data augmentation with School Location Data and Grade Bands
+Run the `cmp_school_elsi_data.py` data script (fuzzy matching using ELSI reports) **or** the `cmp_school_edna_data.py` data script (no fuzzy matching using EDNA/AUN data cache).
 
 ### CMP
 
-Run `cmp_populate_jinja.py` script
+Run the `cmp_populate_jinja.py` script.
 
 #### Post-Processing
 
-Run `cmp_school_elsi_schoolid_postprocess.py` to fuzzy match against the ELSI school data report for NCES codes.  These can be obtained from [https://nces.ed.gov/ccd/elsi/](https://nces.ed.gov/ccd/elsi/). 
+Run `cmp_school_elsi_schoolid_postprocess.py` to fuzzy match against the ELSI school data report for NCES codes, **or** run `cmp_school_edna_schoolid_postprocess.py` to match against online EDNA school data for NCES codes.
 
-To match against Edna data, obtain `SchoolFastFacts_20232024.xlsx - School Fast Facts.csv` and run `python aun_to_nces.py SchoolFastFacts_20232024.xlsx\ -\ School\ Fast\ Facts.csv AUN Schl edna_output.csv`.  Then run `cmp_school_edna_schoolid_postprocess.py`.
-
-Both programs run against `CMP Data Template (long format)_PA.xlsx` and insert the NCES school and district code into the `School Pop. Data` and `School CS Data` tabs.  `aun_to_nces.py` just builds a cache of school mappings, which is filled in by the `cmp_school_edna_schoolid_postprocess.py` script, so in theory one could skip `aun_to_nces.py`.
+Copy the `CMP_Data_Populated - Updated.xlsx` sheets into the CMP Data Template file.
 
 ### PA State code.org Report
 

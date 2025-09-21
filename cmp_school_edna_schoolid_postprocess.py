@@ -8,12 +8,23 @@ from urllib.parse import urljoin, quote_plus
 import requests
 from bs4 import BeautifulSoup, Tag
 import os
+import yaml
+
+try:
+    with open('config.yaml', 'r') as f:
+        config = yaml.safe_load(f)
+except Exception as e:
+    print(f"[config] Failed to load config.yaml: {e}")
+    traceback.print_exc()
+    raise
 
 # ==============================
 # Configuration
 # ==============================
-CMP_FILENAME = "CMP Data Template (long format)_PA.xlsx"  # set to your workbook path when available
-OUTPUT_CSV_FILENAME = "edna_output.csv"
+file_path_prefix       = config['file_path_prefix']
+CMP_FILENAME = f"{file_path_prefix}/CMP_Data_Populated.xlsx"
+OUTPUT_FILENAME = f"{file_path_prefix}/CMP_Data_Populated - Updated.xlsx"
+EDNA_CACHE_CSV = f"{file_path_prefix}/{config['edna_cache']}"
 CMP_SHEETS = ["School Pop. Data", "School CS Data"]
 ENABLE_FUZZY_MATCH = False   # set to False to disable fuzzy matching
 
@@ -30,12 +41,99 @@ except Exception:
         from fuzzywuzzy import process as _fw_process
     except Exception:
         _fw_process = None  # If absent, we'll detect and behave accordingly
-        
+
 FUZZY_THRESHOLD = 60
 
 # ==============================
 # Utilities
 # ==============================
+def _force_screens_url(url_or_href: str) -> str:
+    """
+    If a URL (or href) points to wfInstitutionDetails.aspx without the /Screens/ prefix,
+    normalize it to '/Screens/wfInstitutionDetails.aspx?...'. Works for:
+      - full URLs: http://www.edna.pa.gov/wfInstitutionDetails.aspx?ID=12345
+      - paths:     /wfInstitutionDetails.aspx?ID=12345
+      - bare:      wfInstitutionDetails.aspx?ID=12345
+    Leaves other pages (e.g., wfSchools.aspx) unchanged.
+    """
+    s = (url_or_href or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    if "wfinstitutiondetails.aspx" not in low:
+        return s
+
+    # Strip domain, keep path+query if a full URL
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(s)
+        if p.scheme and p.netloc:
+            s = p.path + (("?" + p.query) if p.query else "")
+    except Exception:
+        pass
+
+    # Ensure leading slash
+    if not s.startswith("/"):
+        s = "/" + s
+
+    # Ensure '/Screens/' prefix
+    if not s.lower().startswith("/screens/"):
+        s = "/Screens" + s
+
+    # Collapse accidental repeats or double slashes
+    s = s.replace("//", "/").replace("/Screens/Screens/", "/Screens/")
+    # Reattach host
+    return urljoin(EDNA_BASE, s)
+
+def _normalize_detail_url(href_or_url: str) -> str:
+    """
+    EDNA sometimes emits links like '/wfInstitutionDetails.aspx?ID=46960'
+    but the working endpoint is '/Screens/wfInstitutionDetails.aspx?ID=46960'.
+    Normalize any variant to the canonical '/Screens/...' path.
+    """
+    try:
+        s = (href_or_url or "").strip()
+        if not s:
+            return s
+
+        # Only touch paths that point at wfInstitutionDetails.aspx
+        # Handle cases with/without leading slash, with querystring, etc.
+        # Examples we fix:
+        #   'wfInstitutionDetails.aspx?ID=46960'
+        #   '/wfInstitutionDetails.aspx?ID=46960'
+        #   'Screens/wfInstitutionDetails.aspx?ID=46960'  (add leading slash)
+        # Leave others alone (e.g., wfSchools.aspx, search pages, etc.)
+        lower = s.lower()
+        if "wfinstitutiondetails.aspx" in lower:
+            # strip leading domain if someone passed a full URL
+            # then operate on just the path+query
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(s)
+                if p.scheme and p.netloc:
+                    s = p.path + (("?" + p.query) if p.query else "")
+            except Exception:
+                pass
+
+            # ensure leading slash
+            if not s.startswith("/"):
+                s = "/" + s
+
+            # ensure '/Screens/' prefix
+            if not s.lower().startswith("/screens/"):
+                # replace leading '/' with '/Screens/'
+                # but if it already starts with '/Screens/' this is no-op
+                s = "/Screens" + s
+
+            # collapse any accidental double '/Screens/Screens/...'
+            s = s.replace("//", "/")
+            s = s.replace("/Screens/Screens/", "/Screens/")
+
+        return s
+    except Exception:
+        traceback.print_exc()
+        return href_or_url
+
 def norm(s: str) -> str:
     return s.strip() if isinstance(s, str) else ""
 
@@ -63,7 +161,7 @@ def build_header_map(ws):
     """Return dict: header_text -> 1-based column index, from the first row in a worksheet."""
     header_cells = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
     return {str(v): i + 1 for i, v in enumerate(header_cells) if v is not None}
-   
+
 def _extract_one(query: str, choices: list[str]):
     """
     Backend-agnostic extractOne(query, choices) -> (best_match, score)
@@ -83,7 +181,7 @@ def _extract_one(query: str, choices: list[str]):
         return None, 0.0
     else:
         return None, 0.0
-  
+
 # ==============================
 # Edna Lookup
 # ==============================
@@ -108,7 +206,7 @@ SCHOOLBRANCH_SEARCH_TEMPLATE = (
 
 def _schoolbranch_search_url(branch_code: str) -> str:
     branch_code = (branch_code or "").strip()
-    branch_code = re.sub(r"\D+", "", branch_code) 
+    branch_code = re.sub(r"\D+", "", branch_code)
     branch_code = branch_code.zfill(4) if branch_code else ""
     return SCHOOLBRANCH_SEARCH_TEMPLATE.format(BRANCH=quote_plus(branch_code))
 
@@ -144,11 +242,11 @@ def _make_session() -> requests.Session:
         "Connection": "close",
     })
     orig = s.request
-    
+
     def wrapped(method, url, **kwargs):
         kwargs.setdefault("timeout", (10, 30))
         return orig(method, url, **kwargs)
-        
+
     s.request = wrapped
     return s
 
@@ -168,25 +266,26 @@ def _pair_key(school: str, district: str) -> str:
 def _derive_district7_from_12(nces12: str) -> str:
     d = _digits_only(nces12)
     return d[:7] if len(d) >= 7 else ""
-            
+
 def _append_if_new(web_row: dict):
     """
-    Append or replace an entry in edna_output.csv using the rule:
+    Maintain edna_output.csv with key = (School Name, District Name).
 
-      Key: (School Name, District Name)
+    Rules:
+      - If no matching key exists -> append web_row.
+      - If matching rows exist AND any have Status=='Open':
+          * Do NOT replace the row(s).
+          * Instead, non-destructively PATCH missing fields in-place from web_row
+            (e.g., fill blank 'Grades', 'NCES Code', 'Detail URL', etc.).
+      - Else (all matches Closed or blank Status) -> replace those rows with web_row.
 
-      - If any existing row for the key has Status == 'Open' (case-insensitive), DO NOT replace.
-      - Else if existing rows are present and all have Status blank or 'Closed', REPLACE them
-        with the scraped web_row (and record scraped Status).
-      - Else if no rows for the key, APPEND scraped web_row.
-
-    Also ensures the CSV has a 'Status' column; if absent, it is created with blanks.
+    Columns are ensured and created if absent. Incoming Status is canonicalized.
     """
-
     append_cols = [
         "School Name",
         "School/Branch",
         "NCES Code",
+        "Grades",
         "Detail URL",
         "District Name",
         "District NCES",
@@ -197,49 +296,65 @@ def _append_if_new(web_row: dict):
     for c in append_cols:
         web_row.setdefault(c, "")
 
-    # Canonicalize incoming Status
+    # Canonicalize Status
     web_row["Status"] = _status_canonicalize(web_row.get("Status", ""))
 
-    # Ensure both files exist with headers
-    _ensure_csv_with_headers(OUTPUT_CSV_FILENAME, append_cols)
+    # Ensure file exists with the right columns
+    _ensure_csv_with_headers(EDNA_CACHE_CSV, append_cols)
 
-    # Load primary (authoritative) file
-    existing = pd.read_csv(OUTPUT_CSV_FILENAME, dtype=str).fillna("")
-    
-    # Ensure columns (including Status) are present even for legacy files
+    # Load
+    existing = pd.read_csv(EDNA_CACHE_CSV, dtype=str).fillna("")
     for c in append_cols:
         if c not in existing.columns:
             existing[c] = ""
 
-    # Build pair key
+    # Match key
     in_school   = _normalize_key(web_row["School Name"])
     in_district = _normalize_key(web_row["District Name"])
-
     mask = (existing["School Name"].map(_normalize_key) == in_school) & \
            (existing["District Name"].map(_normalize_key) == in_district)
     matches = existing[mask]
 
-    if not matches.empty:
-        any_open = any(_status_norm(s) == "open" for s in matches["Status"].tolist())
-        if any_open:
-            print(f"[ONLINE] Skipped update for {web_row['School Name']} / {web_row['District Name']}: existing Status is Open")
-            return
-
-        # All existing Closed or blank -> replace with scraped row
-        remaining = existing[~mask].copy()
-        updated = pd.concat([remaining, pd.DataFrame([web_row])[append_cols]], ignore_index=True)
-
-        # Write to BOTH files (authoritative + stream)
-        updated.to_csv(OUTPUT_CSV_FILENAME, index=False)
-
-        print(f"[ONLINE] Replaced Closed/blank row(s) for {web_row['School Name']} / {web_row['District Name']} in {OUTPUT_CSV_FILENAME}")
+    if matches.empty:
+        _append_row_to_csv(EDNA_CACHE_CSV, append_cols, web_row)
+        print(f"[ONLINE] Appended new row: {web_row['School Name']} / {web_row['District Name']} to {EDNA_CACHE_CSV}")
         return
 
-    # No match -> append to BOTH files
-    _append_row_to_csv(OUTPUT_CSV_FILENAME, append_cols, web_row)
+    # We have at least one match
+    any_open = any(_status_norm(s) == "open" for s in matches["Status"].tolist())
 
-    print(f"[ONLINE] Appended new row: {web_row['School Name']} / {web_row['District Name']} "
-          f"to {OUTPUT_CSV_FILENAME}")
+    if any_open:
+        # Non-destructive PATCH: only fill blanks. Never overwrite nonblank values.
+        patched = existing.copy()
+
+        # Columns we are willing to patch if blank
+        patchable = [
+            "Grades",                       # ← this is the key addition you need
+            "NCES Code",
+            "School/Branch",
+            "Detail URL",
+            "District NCES",
+            "NCES 12-digit (District+Branch)",
+            "Status",                       # allow upgrading blank -> Open/Closed canonical
+        ]
+
+        for idx in patched[mask].index.tolist():
+            for col in patchable:
+                cur = str(patched.at[idx, col] or "").strip()
+                newv = str(web_row.get(col, "") or "").strip()
+                # fill only if current value is blank AND incoming has a value
+                if (not cur) and newv:
+                    patched.at[idx, col] = newv
+
+        patched.to_csv(EDNA_CACHE_CSV, index=False)
+        print(f"[ONLINE] Patched existing Open row(s) for {web_row['School Name']} / {web_row['District Name']} (filled missing fields where available)")
+        return
+
+    # All existing Status are Closed or blank → replace them with web_row (single canonical row)
+    remaining = existing[~mask].copy()
+    updated = pd.concat([remaining, pd.DataFrame([web_row])[append_cols]], ignore_index=True)
+    updated.to_csv(EDNA_CACHE_CSV, index=False)
+    print(f"[ONLINE] Replaced Closed/blank row(s) for {web_row['School Name']} / {web_row['District Name']} in {EDNA_CACHE_CSV}")
 
 def _normalize_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
@@ -313,22 +428,17 @@ def _do_postback(session: requests.Session, page_url: str, target: str, argument
         data=data,
         headers={
             "Referer": page_url,
-            # These two help some servers decide to return delta fragments
             "X-MicrosoftAjax": "Delta=true",
             "X-Requested-With": "XMLHttpRequest",
         },
     )
     pr.raise_for_status()
 
-    # 4) Try to detect and unwrap UpdatePanel delta payloads.
-    #    Typical format: pipe-delimited tokens, with one or more HTML fragments embedded.
     text = pr.text or ""
     ctype = pr.headers.get("Content-Type", "").lower()
     if ("text/plain" in ctype or "application/json" in ctype or "|updatepanel|" in text.lower() or "|pageRedirect|" in text) and "|" in text:
         parts = text.split("|")
-        # Pick candidate HTML fragments
         html_frags = [p for p in parts if "<" in p and ">" in p]
-        # Prefer a fragment that contains a table, otherwise the longest
         pick = None
         for frag in html_frags:
             if "<table" in frag.lower():
@@ -340,11 +450,9 @@ def _do_postback(session: requests.Session, page_url: str, target: str, argument
             bs = BeautifulSoup(pick, "html.parser")
             print(f"[postback] delta payload detected: picked fragment len={len(pick)} tables={len(bs.find_all('table'))}", flush=True)
             return bs
-        # Fallback: parse whole delta as HTML (often empty, but harmless)
         print("[postback] delta payload had no obvious HTML fragment; returning raw parse", flush=True)
         return BeautifulSoup(text, "html.parser")
 
-    # 5) Normal full HTML response
     return BeautifulSoup(text, "html.parser")
 
 def _find_results_table_and_institution_col(soup: BeautifulSoup) -> Tuple[Optional[Tag], Optional[int], Optional[int]]:
@@ -385,7 +493,7 @@ def _find_table_with_header(soup: BeautifulSoup, header_name: str) -> Tuple[Opti
     for table in soup.find_all("table"):
         for tr in table.find_all("tr", recursive=True):
             headers = tr.find_all("th") or tr.find_all("td")
-            if not headers: 
+            if not headers:
                 continue
             hdrs = [_normalize_space(h.get_text(" ", strip=True)) for h in headers]
             for i, h in enumerate(hdrs):
@@ -395,20 +503,19 @@ def _find_table_with_header(soup: BeautifulSoup, header_name: str) -> Tuple[Opti
 
 def _extract_cell_below_header(soup: BeautifulSoup, header: str) -> str:
     table, col_idx, header_row = _find_table_with_header(soup, header)
-    if not table or col_idx is None: 
+    if not table or col_idx is None:
         return ""
-    # prefer tbody rows; else scan rows after header within same table
     tbody = table.find("tbody")
     rows = []
     if tbody:
         rows = [tr for tr in tbody.find_all("tr") if tr.find_all("td")]
     else:
         for tr in header_row.find_all_next("tr"):
-            if tr.find_parent("table") != table: 
+            if tr.find_parent("table") != table:
                 break
-            if tr.find_all("td"): 
+            if tr.find_all("td"):
                 rows.append(tr)
-    if not rows: 
+    if not rows:
         return ""
     tds = rows[0].find_all("td")
     if col_idx < len(tds):
@@ -449,13 +556,11 @@ def _school7_to_school5(school7: str) -> str:
     digits = re.sub(r"\D+", "", school7 or "")
     if not digits:
         return ""
-    # Remove leading zeros; this implements “removing leading 0s … to go from n>5 like 7 to 5”
     trimmed = digits.lstrip("0")
     if trimmed == "":
         return "00000"
     if len(trimmed) <= 5:
         return trimmed.zfill(5)
-    # Still >5 after removing leading zeros (unusual) → keep the last 5
     print(f"[nces][warn] school7 '{school7}' reduced to >5='{trimmed}', using last 5")
     return trimmed[-5:]
 
@@ -474,7 +579,6 @@ def _extract_school_nces7_from_details(soup: BeautifulSoup) -> str:
         m = re.search(r"\b\d{7}\b", s)
         return m.group(0) if m else ""
 
-    # 1) KV-style scan
     kv = _extract_kv_from_all_tables(soup)
     for label in ("NCES Code", "School NCES", "NCES School Code"):
         cand = kv.get(label)
@@ -482,13 +586,11 @@ def _extract_school_nces7_from_details(soup: BeautifulSoup) -> str:
         if n7:
             return n7
 
-    # 2) Demographics header fallback
     demog = _extract_cell_below_header(soup, "NCES Code")
     n7 = _first_7(demog or "")
     if n7:
         return n7
 
-    # 3) Regex proximity to 'NCES'
     text = soup.get_text(" ", strip=True)
     for m in re.finditer(r"\b\d{7}\b", text):
         start, end = m.start(), m.end()
@@ -515,13 +617,11 @@ def _extract_district_nces_from_details(soup: BeautifulSoup) -> str:
       2) Demographics header table under 'NCES Code' (common)
     Returns digits-only string or ''.
     """
-    # Try KV first (handles sites where 'District NCES' appears as a KV)
     kv = _extract_kv_from_all_tables(soup)
     for label in ("District NCES", "NCES District Code", "District NCES Code", "LEA NCES"):
         if kv.get(label):
             return _digits_only(kv[label])
 
-    # Fallback: Demographics header table
     return _digits_only(_extract_cell_below_header(soup, "NCES Code"))
 
 def _normalize_strict(s: str) -> str:
@@ -541,7 +641,7 @@ def _normalize_strict(s: str) -> str:
 def _district_equals(a: str, b: str) -> bool:
     """Require strict equality after normalization (with 40-char truncation)."""
     return _normalize_strict(a) == _normalize_strict(b)
-    
+
 def _search_currentname(session: requests.Session, current_name: str) -> Tuple[List[Tuple[str, str, str]], str]:
     """
     Perform an EDNA search with CurrentName=<current_name>.
@@ -560,17 +660,208 @@ def _fetch_detail_soup(session: requests.Session, search_url: str, href: str) ->
     Follow either a direct link or an ASP.NET postback from a search results row
     and return (detail_soup, detail_url_for_csv).
     """
-    if href.lower().startswith("javascript:"):
-        parsed = _parse_postback_href(href)
-        if not parsed:
-            return None, ""
-        target, argument = parsed
-        soup = _do_postback(session, search_url, target, argument)
-        return soup, ""
-    else:
-        detail_url = urljoin(EDNA_BASE, href)
-        r = session.get(detail_url); r.raise_for_status()
-        return BeautifulSoup(r.text, "html.parser"), detail_url
+    try:
+        if href.lower().startswith("javascript:"):
+            parsed = _parse_postback_href(href)
+            if not parsed:
+                return None, ""
+            target, argument = parsed
+            soup = _do_postback(session, search_url, target, argument)
+            if soup is not None:
+                # For delta postbacks we won't have a stable canonical URL; retain search_url for context.
+                soup.base_url = search_url
+            return soup, ""
+        else:
+            norm_href = _normalize_detail_url(href)
+            detail_url = urljoin(EDNA_BASE, norm_href)
+            r = session.get(detail_url)
+            r.raise_for_status()
+            bs = BeautifulSoup(r.text, "html.parser")
+            bs.base_url = detail_url
+            return bs, detail_url
+    except Exception as e:
+        print(f"[fetch-detail] {e}")
+        traceback.print_exc()
+        return None, ""
+
+# ---------- Grades extraction (ported & adapted from aun_to_nces.py) ----------
+def _table_header_texts(tr: Tag) -> list:
+    headers = tr.find_all("th") or tr.find_all("td")
+    return [_normalize_space(h.get_text(" ", strip=True)) for h in headers]
+
+def _find_table_with_header_loose(soup: BeautifulSoup, header_name: str) -> Tuple[Optional[Tag], Optional[int], Optional[Tag]]:
+    """Loose finder used by grades extractor; similar to above helper."""
+    for table in soup.find_all("table"):
+        header_row = None
+        for tr in table.find_all("tr", recursive=True):
+            if tr.find("th") or tr.find_all("td"):
+                header_row = tr
+                break
+        if not header_row:
+            continue
+        headers = _table_header_texts(header_row)
+        for idx, h in enumerate(headers):
+            if _normalize_space(h).lower() == _normalize_space(header_name).lower():
+                return table, idx, header_row
+    return None, None, None
+
+def _extract_grades_from_details(soup: BeautifulSoup) -> str:
+    """
+    Return a canonical comma-separated grade band (e.g., 'PK, K, 1, 2, ...').
+    Looks for:
+      1) a table headed 'Grades' (original behavior), OR
+      2) any key-value row whose label mentions 'grade' (e.g., 'Grades Served', 'Grade Span').
+    Understands ranges like 'K-12', 'PK–K', '7–12'. Silent (no prints).
+    """
+    try:
+        def _canon_token(t: str) -> str:
+            t = t.strip().upper()
+            if t in ("PK", "K"):
+                return t
+            m = re.fullmatch(r"\d{1,2}", t)
+            return str(int(t)) if m else ""  # normalize leading zeros
+
+        def _rank(t: str) -> int:
+            if t == "PK": return 0
+            if t == "K":  return 1
+            if re.fullmatch(r"\d{1,2}", t): return int(t) + 1
+            return 999
+
+        def _expand_span(a: str, b: str) -> list[str]:
+            A, B = _canon_token(a), _canon_token(b)
+            if not A or not B:
+                return []
+            order = ["PK", "K"] + [str(i) for i in range(1, 13)]
+            ia, ib = order.index(A) if A in order else -1, order.index(B) if B in order else -1
+            if ia < 0 or ib < 0:
+                return []
+            if ia > ib:
+                ia, ib = ib, ia
+            return order[ia:ib+1]
+
+        def _tokens_from_text(txt: str) -> list[str]:
+            if not txt:
+                return []
+            s = _normalize_space(txt)
+            # Split on commas/semicolons first
+            parts = re.split(r"[;,]", s)
+            tokens: list[str] = []
+            for part in parts:
+                # handle spans with -, –, — (hyphen/en/em dashes)
+                m = re.search(r"\b(PK|K|\d{1,2})\s*[-–—]\s*(PK|K|\d{1,2})\b", part, flags=re.IGNORECASE)
+                if m:
+                    tokens += _expand_span(m.group(1), m.group(2))
+                # pick up isolated tokens too
+                for t in re.findall(r"\b(PK|K|\d{1,2})\b", part, flags=re.IGNORECASE):
+                    ct = _canon_token(t)
+                    if ct:
+                        tokens.append(ct)
+            # dedupe & sort semantically
+            seen, uniq = set(), []
+            for t in tokens:
+                if t and t not in seen:
+                    seen.add(t); uniq.append(t)
+            uniq.sort(key=_rank)
+            # collapse to canonical ordered set
+            order = ["PK", "K"] + [str(i) for i in range(1, 13)]
+            return [t for t in order if t in uniq]
+
+        # --- Path 1: original table headed 'Grades'
+        table, grades_col_idx, header_row = _find_table_with_header_loose(soup, "Grades")
+        if table:
+            tbody = table.find("tbody")
+            data_rows = []
+            if tbody:
+                for tr in tbody.find_all("tr"):
+                    if tr.find("th"): continue
+                    if tr.find_all("td"): data_rows.append(tr)
+            else:
+                if header_row:
+                    for tr in header_row.find_all_next("tr"):
+                        if tr.find_parent("table") != table: break
+                        if tr.find("th"): continue
+                        if tr.find_all("td"): data_rows.append(tr)
+                else:
+                    for tr in table.find_all("tr", recursive=True):
+                        if tr.find_all("td"): data_rows.append(tr)
+
+            texts = []
+            for tr in data_rows:
+                tds = tr.find_all("td")
+                if not tds: continue
+                if grades_col_idx is not None and grades_col_idx < len(tds):
+                    texts.append(_normalize_space(tds[grades_col_idx].get_text(" ", strip=True)))
+                else:
+                    texts.append(_normalize_space(tr.get_text(" ", strip=True)))
+
+            tokens = []
+            for txt in texts:
+                tokens += _tokens_from_text(txt)
+
+            if tokens:
+                return ", ".join(tokens)
+
+        # --- Path 2: KV labels that mention 'grade'
+        kv = _extract_kv_from_all_tables(soup)
+        # prefer more specific keys first
+        preferred_labels = [
+            "Grades Served", "Grades Offered", "Grade Span", "Grades",
+            "Lowest Grade", "Highest Grade",
+        ]
+        # 2a) direct preferred labels
+        for label in preferred_labels:
+            if label in kv and kv[label]:
+                toks = _tokens_from_text(kv[label])
+                if toks:
+                    return ", ".join(toks)
+
+        # 2b) any label containing 'grade'
+        for label, value in kv.items():
+            if "grade" in label.lower() and value:
+                toks = _tokens_from_text(value)
+                if toks:
+                    return ", ".join(toks)
+
+        return ""
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+# ---- Grade min/max helpers (derived from the 'Grades' band) ----
+_GRADE_RANK = {"PK": 0, "K": 1}
+_GRADE_RANK.update({str(i): i + 1 for i in range(1, 13)})  # 1..12 → 2..13
+
+def _parse_grade_tokens(grades_str: str) -> list[str]:
+    """
+    Parse a 'Grades' string like 'PK, K, 1, 2, 3, 4' into canonical tokens.
+    Recognizes PK, K, and numerals (1..12).
+    Returns tokens in input order, deduped.
+    """
+    if not grades_str:
+        return []
+    tokens = re.findall(r"\b(?:PK|K|\d{1,2})\b", grades_str, flags=re.IGNORECASE)
+    canon = []
+    seen = set()
+    for t in tokens:
+        t_up = t.upper()
+        # Canonicalize numbers (e.g., '01' → '1')
+        if t_up not in ("PK", "K"):
+            t_up = str(int(t_up))  # safe due to regex
+        if t_up not in seen:
+            seen.add(t_up)
+            canon.append(t_up)
+    return canon
+
+def _lowest_highest_from_tokens(tokens: list[str]) -> tuple[str, str]:
+    """
+    Compute the lowest and highest grade label given canonical tokens.
+    Returns ("", "") if tokens empty or none are recognized.
+    """
+    ranked = [(t, _GRADE_RANK[t]) for t in tokens if t in _GRADE_RANK]
+    if not ranked:
+        return "", ""
+    ranked.sort(key=lambda x: x[1])
+    return ranked[0][0], ranked[-1][0]
 
 def edna_lookup_district_by_name(session: requests.Session, lea_name: str, delay_sec: float = 0.6) -> Tuple[str, str]:
     candidates, search_url = _search_currentname(session, lea_name)
@@ -591,7 +882,6 @@ def edna_lookup_district_by_name(session: requests.Session, lea_name: str, delay
         if not detail_soup:
             continue
 
-        # Use the **hybrid** extractor here:
         district_nces_digits = _extract_district_nces_from_details(detail_soup)
         if len(district_nces_digits) == 7:
             print(f"[online-lookup][district] accepted '{inst_name}' → NCES {district_nces_digits}")
@@ -602,18 +892,6 @@ def edna_lookup_district_by_name(session: requests.Session, lea_name: str, delay
     return "", ""
 
 def edna_lookup_by_name(school_name: str, expected_district: str, delay_sec: float = 0.6) -> Optional[dict]:
-    """
-    Online lookup by school name with exact district match (strict compare via _district_equals).
-    Returns a dict with fields aligned to edna_output.csv schema, or None if no verified match.
-
-    Produces (if resolvable):
-      - 'NCES Code'    := school7 (7-digit) if present; else ''
-      - 'District NCES': district7 (7-digit) if resolved; else ''
-      - 'NCES 12-digit (District+Branch)': district7 + school5 (derived from school7) if both parts present; else ''
-      - 'School/Branch': branch code (string) if present; else ''
-      - 'Detail URL'   : detail URL for the school, if direct-link path used; else ''
-    IMPORTANT: Never use SchoolBranch/Location to compose the 12-digit.
-    """
     school_name = norm(school_name)
     expected_district = norm(expected_district)
     if not school_name:
@@ -622,154 +900,126 @@ def edna_lookup_by_name(school_name: str, expected_district: str, delay_sec: flo
     session = _make_session()
     try:
         candidates, search_url = _search_currentname(session, school_name)
-    except Exception as e:
-        print(f"[online-lookup][name] fetch search failed for '{school_name}': {e}")
+    except Exception:
         traceback.print_exc()
+        print(f"[grades] url={_force_screens_url(_currentname_search_url(school_name))} school=\"{school_name}\" district=\"{expected_district}\" branch=— grades=\"\"")
         return None
 
     if not candidates:
-        print(f"[online-lookup][name] no candidates for '{school_name}'")
+        print(f"[grades] url={_force_screens_url(_currentname_search_url(school_name))} school=\"{school_name}\" district=\"{expected_district}\" branch=— grades=\"—\"")
         return None
 
     for i, (inst_name, branch, href) in enumerate(candidates, start=1):
-        # Require Institution Name === school_name (strict-normalized)
         if _normalize_strict(inst_name) != _normalize_strict(school_name):
             continue
-
         try:
             time.sleep(delay_sec)
-            detail_soup, detail_url_for_csv = _fetch_detail_soup(session, search_url, href)
-        except Exception as e:
-            print(f"[online-lookup][name] candidate #{i} detail fetch failed: {e}")
+            # --- Force /Screens/ here ---
+            detail_soup, detail_url_for_csv = _fetch_detail_soup(session, search_url, _force_screens_url(href))
+        except Exception:
             traceback.print_exc()
+            print(f"[grades] url={_force_screens_url(search_url)} school=\"{inst_name}\" district=\"{expected_district}\" branch={branch or '—'} grades=\"\"")
             continue
         if not detail_soup:
-            print(f"[online-lookup][name] candidate #{i} detail soup empty")
+            print(f"[grades] url={_force_screens_url(search_url)} school=\"{inst_name}\" district=\"{expected_district}\" branch={branch or '—'} grades=\"—\"")
             continue
 
-        # Extract school NCES (7-digit) and district name from the school page
         school7 = _extract_school_nces7_from_details(detail_soup) or ""
         district_name = _extract_district_name_from_details(detail_soup) or ""
+        grades = _extract_grades_from_details(detail_soup) or ""
+        url_for_log = _force_screens_url(detail_url_for_csv or getattr(detail_soup, "base_url", "") or search_url)
 
-        # District must match the expected district strictly
         if not _district_equals(district_name, expected_district):
-            print(f"[online-lookup][name] skip candidate #{i}: district mismatch "
-                  f"(saw '{district_name}' vs expected '{expected_district}')")
+            print(f"[grades] url={url_for_log} school=\"{inst_name}\" district=\"{district_name or '—'}\" branch={branch or '—'} grades=\"{grades or '—'}\"")
             continue
 
-        # Resolve district NCES (7-digit) from the district (LEA) page
-        district7, district_detail_url = edna_lookup_district_by_name(session, district_name, delay_sec)
-
-        # Compose strictly from district7 + school5 (if both present)
+        district7, _ = edna_lookup_district_by_name(session, district_name, delay_sec)
         school5 = _school7_to_school5(school7) if school7 else ""
         nces12 = f"{district7}{school5}" if (len(district7) == 7 and len(school5) == 5) else ""
-
-        if not (school7 or nces12):
-            print(f"[online-lookup][name] skip candidate #{i} '{inst_name}': no usable NCES parts "
-                  f"(district7='{district7 or '—'}', school7='{school7 or '—'}')")
-            continue
 
         row = {
             "School Name": inst_name,
             "School/Branch": f'="{branch}"' if branch else "",
             "NCES Code": f'="{school7}"' if school7 else "",
-            "Detail URL": detail_url_for_csv,
+            "Grades": grades,
+            "Detail URL": url_for_log,  # already normalized
             "District Name": district_name,
             "District NCES": f'="{district7}"' if district7 else "",
             "NCES 12-digit (District+Branch)": f'="{nces12}"' if nces12 else "",
         }
-        print(f"[ONLINE][name] accepted: {inst_name} "
-              f"(school7: {school7 or '—'}, district7: {district7 or '—'}, 12-digit: {nces12 or '—'})")
+        print(f"[grades] url={url_for_log} school=\"{inst_name}\" district=\"{district_name}\" branch={branch or '—'} grades=\"{grades or '—'}\"")
         return row
 
-    print(f"[online-lookup][name] no verified candidate for '{school_name}' in district '{expected_district}'")
+    print(f"[grades] url={_force_screens_url(_currentname_search_url(school_name))} school=\"{school_name}\" district=\"{expected_district}\" branch=— grades=\"—\"")
     return None
 
 def edna_lookup_by_location_id(location_id: str, delay_sec: float = 0.6) -> Optional[dict]:
     """
-    Online lookup by SchoolBranch=<LOCATION_ID> (zero-padded to 4).
-    Produces the same fields as the name-based path.
-    IMPORTANT: Never use SchoolBranch/Location to compose the 12-digit.
+    Online lookup by SchoolBranch=<LOCATION_ID>.
+    Prints exactly one [grades] line for the accepted candidate; otherwise logs with empty grades.
     """
     loc = _digits_only(location_id).zfill(4)
     if not loc or len(loc) != 4:
+        print(f"[grades] url={EDNA_BASE}/Screens/wfSearchEntityResults.aspx school=\"—\" district=\"—\" branch={loc or '—'} grades=\"—\"")
         return None
 
     session = _make_session()
     try:
         candidates, search_url = _search_schoolbranch(session, loc)
-    except Exception as e:
-        print(f"[online-lookup][location_id] fetch search failed for '{loc}': {e}")
+    except Exception:
+        traceback.print_exc()
+        print(f"[grades] url={_schoolbranch_search_url(loc)} school=\"—\" district=\"—\" branch={loc} grades=\"\"")
         return None
 
     if not candidates:
-        print(f"[online-lookup][location_id] no candidates for '{loc}'")
+        print(f"[grades] url={_schoolbranch_search_url(loc)} school=\"—\" district=\"—\" branch={loc} grades=\"—\"")
         return None
 
     for i, (inst_name, branch, href) in enumerate(candidates, start=1):
         try:
             time.sleep(delay_sec)
             detail_soup, detail_url_for_csv = _fetch_detail_soup(session, search_url, href)
-        except Exception as e:
-            print(f"[online-lookup][location_id] candidate #{i} detail fetch failed: {e}")
+        except Exception:
+            traceback.print_exc()
+            print(f"[grades] url={search_url} school=\"{inst_name}\" district=\"—\" branch={branch or '—'} grades=\"\"")
             continue
         if not detail_soup:
-            print(f"[online-lookup][location_id] candidate #{i} detail soup empty")
+            print(f"[grades] url={search_url} school=\"{inst_name}\" district=\"—\" branch={branch or '—'} grades=\"—\"")
             continue
 
-        # Extract school7 and district name from the school page
         school7 = _extract_school_nces7_from_details(detail_soup) or ""
         district_name = _extract_district_name_from_details(detail_soup) or ""
+        grades = _extract_grades_from_details(detail_soup) or ""
+        url_for_log = detail_url_for_csv or getattr(detail_soup, "base_url", "") or search_url
 
-        # Resolve district7 (LEA page)
-        district7, district_detail_url = edna_lookup_district_by_name(session, district_name, delay_sec)
-
-        # Compose strictly from district7 + school5 (if both present)
+        district7, _ = edna_lookup_district_by_name(session, district_name, delay_sec)
         school5 = _school7_to_school5(school7) if school7 else ""
         nces12 = f"{district7}{school5}" if (len(district7) == 7 and len(school5) == 5) else ""
 
         if not nces12:
-            print(f"[online-lookup][location_id] skip candidate #{i} '{inst_name}': no usable NCES parts "
-                  f"(district7='{district7 or '—'}', school7='{school7 or '—'}'; SchoolBranch={loc})")
+            print(f"[grades] url={url_for_log} school=\"{inst_name}\" district=\"{district_name or '—'}\" branch={branch or '—'} grades=\"{grades or '—'}\"")
             continue
 
         row = {
             "School Name": inst_name,
             "School/Branch": f'="{branch}"' if branch else "",
             "NCES Code": f'="{school7}"' if school7 else "",
+            "Grades": grades,
             "Detail URL": detail_url_for_csv,
             "District Name": district_name,
             "District NCES": f'="{district7}"' if district7 else "",
             "NCES 12-digit (District+Branch)": f'="{nces12}"',
         }
-        print(f"[ONLINE][location_id] accepted: {inst_name} "
-              f"(school7: {school7 or '—'}, district7: {district7 or '—'}, 12-digit: {nces12})")
+        print(f"[grades] url={url_for_log} school=\"{inst_name}\" district=\"{district_name or '—'}\" branch={branch or '—'} grades=\"{grades or '—'}\"")
         return row
 
-    print(f"[online-lookup][location_id] no verified candidate for SchoolBranch={loc}")
+    print(f"[grades] url={_schoolbranch_search_url(loc)} school=\"—\" district=\"—\" branch={loc} grades=\"—\"")
     return None
 
 # ==============================
 # Edna District pre-crawl: collect schools into edna_output.csv
 # ==============================
 
-def _debug_dump_html_snippet(soup: BeautifulSoup, tag: str = "schools"):
-    try:
-        txt = str(soup)
-        print(f"[debug:{tag}] html head:\n{txt[:1500]}\n--- [truncated len={len(txt)}] ---", flush=True)
-    except Exception:
-        pass
-
-def _debug_dump_pager(schools_soup):
-    pager = schools_soup.find(
-        lambda t: t and t.name in ("div","td","span","ul","nav")
-        and (("page" in (t.get("class") or [])) or ("Page size:" in t.get_text(" ", strip=True)))
-    )
-    if pager:
-        print(str(pager)[:1000])
-    else:
-        print("[debug] pager not found")  
-    
 def _ensure_csv_with_headers(path: str, cols: list[str]):
     """Create CSV with given columns if it doesn't exist."""
     if not os.path.exists(path):
@@ -781,18 +1031,19 @@ def _append_row_to_csv(path: str, cols: list[str], row: dict):
     pd.DataFrame([row])[cols].to_csv(path, mode="a", index=False, header=False)
 
 def _ensure_output_csv_exists():
-    """Guarantee that edna_output.csv exists with the proper columns."""
+    """Guarantee that edna_output.csv exists with the proper columns (including Grades)."""
     cols = [
         "School Name",
         "School/Branch",
         "NCES Code",
+        "Grades",  # NEW
         "Detail URL",
         "District Name",
         "District NCES",
         "NCES 12-digit (District+Branch)",
         "Status",
     ]
-    _ensure_csv_with_headers(OUTPUT_CSV_FILENAME, cols)
+    _ensure_csv_with_headers(EDNA_CACHE_CSV, cols)
 
 def _collect_unique_district_names_from_workbook(xlsx_path: str, sheets: list[str]) -> list[str]:
     """
@@ -810,7 +1061,6 @@ def _collect_unique_district_names_from_workbook(xlsx_path: str, sheets: list[st
         except Exception as e:
             print(f"[district-prep] Failed reading sheet '{sheet}': {e}")
             traceback.print_exc()
-    # de-dupe with case/space normalization consistent with strict compare
     seen = set()
     out = []
     for d in districts:
@@ -820,22 +1070,7 @@ def _collect_unique_district_names_from_workbook(xlsx_path: str, sheets: list[st
             out.append(d)
     return out
 
-def _find_link_by_text(soup: BeautifulSoup, target_text: str) -> Optional[Tag]:
-    """
-    Find an <a> whose visible text matches target_text (case-insensitive, trimmed).
-    """
-    tnorm = _normalize_space(target_text).lower()
-    for a in soup.find_all("a", href=True):
-        if _normalize_space(a.get_text(" ", strip=True)).lower() == tnorm:
-            return a
-    return None
-
 def _click_link_or_postback(session: requests.Session, page_url: str, a_tag: Tag) -> Optional[BeautifulSoup]:
-    """
-    Follow a standard href OR execute __doPostBack for javascript: links.
-    After navigation, if the resulting page contains a single <iframe>, fetch its src and return that DOM instead.
-    Returns BeautifulSoup of the best candidate DOM.
-    """
     href = (a_tag.get("href") or "").strip()
     if not href:
         print("[nav] anchor missing href")
@@ -845,13 +1080,15 @@ def _click_link_or_postback(session: requests.Session, page_url: str, a_tag: Tag
         try:
             r = session.get(url, headers={"Referer": ref} if ref else None)
             r.raise_for_status()
-            return BeautifulSoup(r.text, "html.parser")
+            bs = BeautifulSoup(r.text, "html.parser")
+            bs.base_url = url
+            return bs
         except Exception as e:
             print(f"[nav] GET {url} failed: {e}")
             traceback.print_exc()
             return None
 
-    # 1) Navigate
+    # Handle postbacks
     if href.lower().startswith("javascript:"):
         parsed = _parse_postback_href(href)
         if not parsed:
@@ -864,19 +1101,19 @@ def _click_link_or_postback(session: requests.Session, page_url: str, a_tag: Tag
             print(f"[postback] error: {e}")
             traceback.print_exc()
             return None
-        nav_url = page_url  # postbacks usually retain the same url
+        nav_url = page_url
     else:
-        nav_url = urljoin(EDNA_BASE, href)
+        # <<< normalize detail URLs here >>>
+        norm_href = _normalize_detail_url(href)
+        nav_url = urljoin(EDNA_BASE, norm_href)
         soup = _fetch(nav_url, ref=page_url)
         if not soup:
             return None
 
-    # 2) If tab uses UpdatePanel, sometimes a second GET returns a fully rendered view
     if soup:
-        # quick signal to debug what we got
         print(f"[trace] after click/postback: url≈{nav_url} len(html)={len(str(soup))} tables={len(soup.find_all('table'))}", flush=True)
 
-    # 3) If content is inside an iframe, follow it
+    # Follow likely school/branches iframe if present (unchanged)
     try:
         iframes = soup.find_all("iframe")
         if len(iframes) == 1 and iframes[0].get("src"):
@@ -887,7 +1124,6 @@ def _click_link_or_postback(session: requests.Session, page_url: str, a_tag: Tag
                 print(f"[trace] iframe fetch len(html)={len(str(soup_iframe))} tables={len(soup_iframe.find_all('table'))}", flush=True)
                 return soup_iframe
         elif len(iframes) > 1:
-            # pick the first that mentions school/branch in its attributes
             for fr in iframes:
                 src = fr.get("src", "")
                 title = fr.get("title", "")
@@ -903,66 +1139,49 @@ def _click_link_or_postback(session: requests.Session, page_url: str, a_tag: Tag
         print(f"[trace] iframe follow error: {e}")
         traceback.print_exc()
 
-    # 4) Fallback: return whatever we got
     return soup
 
 def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
     """
-    Robust parser for the district 'Schools/Branches' listing.
-    Heuristics:
-      - Accept headers that LOOK LIKE institution+branch even if formatted oddly
-      - Accept optional NCES and Status columns with varied names
-      - If headers fail, fall back to "row-shape" detection: an anchor name + a 4-digit branch cell
-    Returns a list of dicts: {name, branch, nces7, status, detail_href}
+    Robust parser for a district's 'Schools/Branches' listing.
+    Returns a list of dicts: {name, branch, nces7, status, detail_href}.
+    NEVER returns None; returns [] if nothing parseable is found.
     """
 
     def canon(s: str) -> str:
-        # normalize header/label text aggressively
         s = _normalize_space(s).lower()
         s = re.sub(r"[^a-z0-9]+", " ", s)
         return s.strip()
 
     def header_index_map(header_cells: list[str]) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
-        """Return (inst_idx, branch_idx, nces_idx, status_idx) using flexible matching."""
         inst_idx = branch_idx = nces_idx = status_idx = None
         H = [canon(h) for h in header_cells]
 
-        # Institution column: look for tokens like 'institution name', 'school name', 'name'
         for i, h in enumerate(H):
-            if "institution" in h and "name" in h:
-                inst_idx = i; break
+            if "institution" in h and "name" in h: inst_idx = i; break
         if inst_idx is None:
             for i, h in enumerate(H):
-                if "school" in h and "name" in h:
-                    inst_idx = i; break
+                if "school" in h and "name" in h: inst_idx = i; break
         if inst_idx is None:
             for i, h in enumerate(H):
-                if h == "name":
-                    inst_idx = i; break
+                if h == "name": inst_idx = i; break
 
-        # Branch column: variants like 'school/branch', 'branch', 'school branch', 'location id'
         for i, h in enumerate(H):
-            if "school" in h and "branch" in h:
-                branch_idx = i; break
+            if "school" in h and "branch" in h: branch_idx = i; break
         if branch_idx is None:
             for i, h in enumerate(H):
-                if "branch" == h or h == "branch code" or h == "location id" or ("branch" in h and "code" in h):
+                if h in {"branch", "branch code", "location id"} or ("branch" in h and "code" in h):
                     branch_idx = i; break
 
-        # NCES column (optional)
         for i, h in enumerate(H):
-            if "nces" in h:
-                nces_idx = i; break
+            if "nces" in h: nces_idx = i; break
 
-        # Status column (optional)
         for i, h in enumerate(H):
-            if "status" in h:
-                status_idx = i; break
+            if "status" in h: status_idx = i; break
 
         return inst_idx, branch_idx, nces_idx, status_idx
 
     def extract_headers_from_table(table: Tag) -> list[str]:
-        # try thead, else first row
         thead = table.find("thead")
         if thead:
             tr = thead.find("tr")
@@ -977,7 +1196,7 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
     tables = soup.find_all("table")
     print(f"[trace] _schools_table_parse: found {len(tables)} table(s) on page", flush=True)
 
-    # Pass 1: header-driven extraction
+    # -------- Pass 1: header-driven extraction
     for table in tables:
         headers = extract_headers_from_table(table)
         if not headers:
@@ -994,7 +1213,6 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
             tds = tr.find_all("td")
             if not tds:
                 continue
-            # Bounds check
             mx = max(inst_idx, branch_idx)
             if len(tds) <= mx:
                 continue
@@ -1002,7 +1220,9 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
             name_cell = tds[inst_idx]
             name = _normalize_space(name_cell.get_text(" ", strip=True))
             a = name_cell.find("a", href=True)
-            href = a["href"].strip() if a else ""
+            href_raw = a["href"].strip() if a else ""
+            href = _force_screens_url(href_raw)  # <- normalize immediately
+
             branch = _normalize_space(tds[branch_idx].get_text(" ", strip=True))
 
             nces7 = ""
@@ -1025,11 +1245,9 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
 
         if row_count:
             print(f"[trace] header-parse hit: headers={headers} rows={row_count}", flush=True)
-            # Usually there is only one relevant table; stop after first hit
-            return results
+            return results  # List (non-empty)
 
-    # Pass 2: shape-driven fallback (no good headers found)
-    # Heuristic: a row where one cell is a 4-digit branch and another cell has an <a> (name link)
+    # -------- Pass 2: shape-driven fallback
     def looks_like_branch(s: str) -> bool:
         return bool(re.fullmatch(r"\d{4}", _digits_only(s).zfill(4)))
 
@@ -1041,7 +1259,6 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
                 continue
             link_cell = None
             branch_cell_text = ""
-            # find any anchor and any 4-digit cell
             for td in tds:
                 if (not link_cell) and td.find("a", href=True):
                     link_cell = td
@@ -1050,7 +1267,8 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
                     branch_cell_text = _digits_only(text).zfill(4)
             if link_cell and branch_cell_text:
                 name = _normalize_space(link_cell.get_text(" ", strip=True))
-                href = link_cell.find("a", href=True)["href"].strip()
+                href_raw = link_cell.find("a", href=True)["href"].strip()
+                href = _force_screens_url(href_raw)
                 results.append({
                     "name": name,
                     "branch": branch_cell_text,
@@ -1061,29 +1279,20 @@ def _schools_table_parse(soup: BeautifulSoup) -> list[dict]:
 
     if results:
         print(f"[trace] shape-parse hit: rows={len(results)} (no reliable headers)", flush=True)
-    else:
-        # Dump first 3 tables' headers for debugging
-        hdr_summaries = []
-        for t in tables[:3]:
-            hdr = extract_headers_from_table(t)
-            hdr_summaries.append(hdr)
-        print(f"[trace] no rows parsed; sample headers={hdr_summaries}", flush=True)
+        return results
 
-    return results
+    # -------- Nothing parseable; return an empty list (not None)
+    hdr_summaries = []
+    for t in tables[:3]:
+        hdr_summaries.append(extract_headers_from_table(t))
+    print(f"[trace] no rows parsed; sample headers={hdr_summaries}", flush=True)
+    return []  
 
 def _detect_current_page_num(pager_root: Tag) -> int:
-    """
-    Try to detect the *current* page number from a pager area.
-    Common WebForms pattern: the current page is rendered as a plain <span> '1'
-    while other pages are <a> with __doPostBack('...','Page$N').
-    Returns an integer >=1 if found, else 0.
-    """
     try:
-        # Look for a bare number inside a <span> with neighboring numeric links
         for sp in pager_root.find_all("span"):
             txt = _normalize_space(sp.get_text(" ", strip=True))
             if re.fullmatch(r"\d+", txt):
-                # Heuristic: if siblings include any link to Page$<num>, treat this as current
                 sib_text = " ".join(a.get_text(" ", strip=True) for a in pager_root.find_all("a"))
                 if re.search(r"\b\d+\b", sib_text):
                     return int(txt)
@@ -1091,43 +1300,28 @@ def _detect_current_page_num(pager_root: Tag) -> int:
         traceback.print_exc()
     return 0
 
-
 def _paginate_next(session: requests.Session,
                    current_url: str,
                    current_soup: BeautifulSoup) -> Optional[tuple[BeautifulSoup, str]]:
-    """
-    Navigate to the *next* page of a WebForms GridView-style pager.
-    Handles:
-      • LinkButtons that call __doPostBack('target','Page$Next') in href or onclick
-      • Numeric paging: __doPostBack('target','Page$N') with a <span>N</span> as current
-      • True <a href="…"> links (rare on this site)
-    Returns (next_soup, referrer_url) or None if no next page is available.
-    """
     try:
-        # 0) Fast path: literal "Next" anchor (visible text)
         for a in current_soup.find_all("a", href=True):
             label = _normalize_space(a.get_text(" ", strip=True)).lower()
             if label in {"next", "next >", ">", "›", "»"}:
                 soup2 = _click_link_or_postback(session, current_url, a)
                 return (soup2, current_url) if soup2 else None
 
-        # 1) Scan all potential clickables for __doPostBack
         target_next = None
         arg_next = None
-        numeric_candidates: list[tuple[int, str, str, Tag]] = []  # (page_num, target, arg, tag)
+        numeric_candidates: list[tuple[int, str, str, Tag]] = []
 
         def consider_element(tag: Tag):
             nonlocal target_next, arg_next, numeric_candidates
-            # Check both href and onclick (onclick often holds the postback)
             for attr in ("href", "onclick"):
                 val = (tag.get(attr) or "").strip()
                 if not val:
                     continue
-
-                # Try strict "javascript:__doPostBack(…)" first
                 m = POSTBACK_RE.match(val)
                 if not m:
-                    # Fall back to broad "…__doPostBack('t','a')…" search (handles onclick)
                     m2 = POSTBACK_ANY_RE.search(val)
                     if not m2:
                         continue
@@ -1151,14 +1345,11 @@ def _paginate_next(session: requests.Session,
             if target_next and arg_next:
                 break
 
-        # 2) Explicit Next
         if target_next and arg_next:
             soup2 = _do_postback(session, current_url, target_next, arg_next)
             return (soup2, current_url) if soup2 else None
 
-        # 3) Numeric paging: choose current+1 if we can detect the current page
         if numeric_candidates:
-            # Find a likely pager root by intersecting ancestors (best-effort)
             pager_root = None
             try:
                 parents = []
@@ -1187,13 +1378,11 @@ def _paginate_next(session: requests.Session,
                         soup2 = _do_postback(session, current_url, tgt, arg)
                         return (soup2, current_url) if soup2 else None
 
-            # Fallback: pick the smallest numeric candidate ≥ 2
             for page_num, tgt, arg, _ in sorted(numeric_candidates, key=lambda t: t[0]):
                 if page_num >= 2:
                     soup2 = _do_postback(session, current_url, tgt, arg)
                     return (soup2, current_url) if soup2 else None
 
-        # 4) ARIA/title hints (e.g., right-arrow without text)
         for tag in current_soup.find_all(True):
             labelled = (_normalize_space(tag.get("aria-label", "")) + " " +
                         _normalize_space(tag.get("title", ""))).lower()
@@ -1211,7 +1400,6 @@ def _paginate_next(session: requests.Session,
                         soup2 = _do_postback(session, current_url, tgt, arg)
                         return (soup2, current_url) if soup2 else None
 
-        # 5) Probably last page
         return None
 
     except Exception as e:
@@ -1219,49 +1407,9 @@ def _paginate_next(session: requests.Session,
         traceback.print_exc()
         return None
 
-def _paginate_goto(session: requests.Session,
-                   current_url: str,
-                   current_soup: BeautifulSoup,
-                   page_number: int) -> Optional[tuple[BeautifulSoup, str]]:
-    """
-    Jump directly to Page$<page_number> if that postback exists
-    (handles both href="javascript:..." and onclick="return __doPostBack(...)").
-    """
-    try:
-        arg_want = f"Page${page_number}"
-        for tag in current_soup.find_all(["a", "button", "span", "input"]):
-            for attr in ("href", "onclick"):
-                val = (tag.get(attr) or "").strip()
-                if not val:
-                    continue
-
-                m = POSTBACK_RE.match(val)
-                if not m:
-                    m2 = POSTBACK_ANY_RE.search(val)
-                    if not m2:
-                        continue
-                    tgt, arg = html.unescape(m2.group("target")), html.unescape(m2.group("arg"))
-                else:
-                    tgt, arg = html.unescape(m.group(1)), html.unescape(m.group(2))
-
-                if arg == arg_want:
-                    soup2 = _do_postback(session, current_url, tgt, arg)  # <- fixed name
-                    return (soup2, current_url) if soup2 else None
-        return None
-    except Exception as e:
-        print(f"[_paginate_goto] {e}")
-        traceback.print_exc()
-        return None
-
 def _open_schools_branches_direct(session: requests.Session,
                                   detail_soup: BeautifulSoup,
                                   referer_url: str = "") -> Optional[tuple[BeautifulSoup, str]]:
-    """
-    Open the 'Schools/Branches' page directly via /Screens/Details/wfSchools.aspx?ID=NNNNN.
-    We find the numeric ID from the district detail soup (or referer URL),
-    build the schools URL, GET it, and return (soup, referer_url_for_next).
-    """
-    # 1) If the page already exposes a direct schools link, use it first.
     for a in detail_soup.find_all("a", href=True):
         href = a["href"]
         if "wfSchools.aspx" in href and "ID=" in href:
@@ -1276,7 +1424,6 @@ def _open_schools_branches_direct(session: requests.Session,
                 traceback.print_exc()
                 return None
 
-    # 2) Otherwise, extract the entity id and construct the URL.
     entity_id = _extract_entity_id_from_soup(detail_soup, fallback_urls=[referer_url])
     if not entity_id:
         print("[district] could not find entity ID to build wfSchools.aspx link")
@@ -1299,31 +1446,52 @@ def _open_schools_branches_direct(session: requests.Session,
 
 def _append_school_row_from_listing(district_name: str, district7: str,
                                     listing_row: dict, session: requests.Session, referer_url: str):
-    """
-    Convert one listing row to our CSV schema and append/replace per rules.
-    """
     school_name = listing_row.get("name", "")
     branch = listing_row.get("branch", "")
     school7 = listing_row.get("nces7", "")
     href = listing_row.get("detail_href", "")
-    status = _status_canonicalize(listing_row.get("status", ""))  # ensure canonical
+    status = _status_canonicalize(listing_row.get("status", ""))
+
+    grades = ""
+    detail_url = ""
+
+    try:
+        if href and not href.lower().startswith("javascript:"):
+            # --- Force /Screens/ here ---
+            detail_url = _force_screens_url(href)
+            r = session.get(detail_url, headers={"Referer": referer_url} if referer_url else None)
+            r.raise_for_status()
+            dsoup = BeautifulSoup(r.text, "html.parser"); dsoup.base_url = detail_url
+
+            school7_page = _extract_school_nces7_from_details(dsoup) or ""
+            if school7_page and not school7:
+                school7 = school7_page
+
+            grades = _extract_grades_from_details(dsoup) or ""
+
+            # --- Force /Screens/ in the one-liner too ---
+            print(f"[grades] url={_force_screens_url(detail_url)} school=\"{school_name}\" district=\"{district_name}\" branch={branch or '—'} grades=\"{grades or '—'}\"")
+        else:
+            url_for_log = referer_url or (EDNA_BASE + "/")
+            print(f"[grades] url={_force_screens_url(url_for_log)} school=\"{school_name}\" district=\"{district_name}\" branch={branch or '—'} grades=\"—\"")
+    except Exception:
+        url_for_log = detail_url or referer_url or (EDNA_BASE + "/")
+        print(f"[grades] url={_force_screens_url(url_for_log)} school=\"{school_name}\" district=\"{district_name}\" branch={branch or '—'} grades=\"\"")
+        traceback.print_exc()
 
     school5 = _school7_to_school5(school7) if school7 else ""
     nces12 = f"{district7}{school5}" if (len(_digits_only(district7)) == 7 and len(school5) == 5) else ""
-
-    detail_url = ""
-    if href and not href.lower().startswith("javascript:"):
-        detail_url = urljoin(EDNA_BASE, href)
 
     web_row = {
         "School Name": school_name,
         "School/Branch": f'="{branch}"' if branch else "",
         "NCES Code": f'="{school7}"' if school7 else "",
+        "Grades": grades,
         "Detail URL": detail_url,
         "District Name": district_name,
         "District NCES": f'="{district7}"' if district7 else "",
         "NCES 12-digit (District+Branch)": f'="{nces12}"' if nces12 else "",
-        "Status": status,  # NEW
+        "Status": status,
     }
 
     try:
@@ -1333,28 +1501,17 @@ def _append_school_row_from_listing(district_name: str, district7: str,
         traceback.print_exc()
 
 def _extract_entity_id_from_soup(detail_soup: BeautifulSoup, fallback_urls: list[str] = None) -> str:
-    """
-    Try to recover the numeric ?ID=XXXXX for the current district.
-    Strategy:
-      1) Look for any <a> with href containing '?ID=digits'
-      2) If not found, scan the page text (rare)
-      3) If still not found, try any fallback URLs provided
-    Returns digits-only string or ''.
-    """
-    # from anchors
     for a in detail_soup.find_all("a", href=True):
         href = a["href"]
         m = re.search(r"[?&]ID=(\d+)", href, flags=re.IGNORECASE)
         if m:
             return m.group(1)
 
-    # from text (edge case)
     txt = detail_soup.get_text(" ", strip=True)
     m = re.search(r"[?&]ID=(\d+)", txt, flags=re.IGNORECASE)
     if m:
         return m.group(1)
 
-    # check fallback URLs
     if fallback_urls:
         for u in fallback_urls:
             if not u:
@@ -1365,11 +1522,7 @@ def _extract_entity_id_from_soup(detail_soup: BeautifulSoup, fallback_urls: list
 
     return ""
 
-
 def _build_schools_url(entity_id: str) -> str:
-    """
-    Construct the Schools/Branches URL from the numeric entity id.
-    """
     eid = _digits_only(entity_id)
     if not eid:
         return ""
@@ -1377,14 +1530,8 @@ def _build_schools_url(entity_id: str) -> str:
 
 def prepopulate_edna_from_districts(xlsx_path: str, sheets: list[str], delay_sec: float = 0.6):
     """
-    1) Gather unique district names from the workbook.
-    2) For each district:
-       - Search CurrentName=<district>
-       - From results, click entries whose 'School/Branch' == '0000' (district rows)
-       - On the district detail page, read District NCES (7-digit)
-       - Open Schools/Branches directly via /Screens/Details/wfSchools.aspx?ID=...
-       - Iterate all pages (Next)
-       - Append each school listing into edna_output.csv if missing
+    Crawl district → schools listings and populate edna_output.csv.
+    Now captures Grades by visiting each school detail page (direct-link rows).
     """
     districts = _collect_unique_district_names_from_workbook(xlsx_path, sheets)
     if not districts:
@@ -1398,7 +1545,6 @@ def prepopulate_edna_from_districts(xlsx_path: str, sheets: list[str], delay_sec
         if not lea_name:
             continue
 
-        # Search by CurrentName
         try:
             candidates, search_url = _search_currentname(session, lea_name)
         except Exception as e:
@@ -1410,14 +1556,12 @@ def prepopulate_edna_from_districts(xlsx_path: str, sheets: list[str], delay_sec
             print(f"[district-prep] no candidates for '{lea_name}'")
             continue
 
-        # filter to district-level rows: School/Branch == 0000
         district_rows = [(nm, br, href) for (nm, br, href) in candidates if _normalize_space(br) == "0000"]
         if not district_rows:
             print(f"[district-prep] no '0000' district rows for '{lea_name}'")
             continue
 
         for (inst_name, _branch, href) in district_rows:
-            # Fetch district detail page (to read NCES + recover the ID)
             try:
                 time.sleep(delay_sec)
                 detail_soup, detail_url = _fetch_detail_soup(session, search_url, href)
@@ -1429,26 +1573,24 @@ def prepopulate_edna_from_districts(xlsx_path: str, sheets: list[str], delay_sec
                 print(f"[district-prep] empty detail soup for '{inst_name}'")
                 continue
 
-            # District NCES (needed to build 12-digit later)
             district7 = _extract_district_nces_from_details(detail_soup)
             if len(_digits_only(district7)) != 7:
                 print(f"[district-prep] '{inst_name}' missing 7-digit District NCES (saw '{district7}')")
                 continue
 
-            # Open the Schools/Branches page directly using the ID
             tab = _open_schools_branches_direct(session, detail_soup, referer_url=(detail_url or search_url))
             if not tab:
                 print(f"[district-prep] could not open Schools/Branches for '{inst_name}'")
                 continue
             schools_soup, referer_url = tab
 
-            # Iterate pages
             page_num = 1
             while True:
-                # Parse listings from this page
-                rows = _schools_table_parse(schools_soup)
+                rows = _schools_table_parse(schools_soup) or []   
+                if not rows:
+                    print(f"[schools] zero-rows url={referer_url} inst=\"{inst_name}\" district7={_digits_only(district7)}")
+                
                 if not rows and page_num == 1:
-                    # Quick debug dump if first page had nothing
                     try:
                         txt = str(schools_soup)
                         print(f"[debug:schools_tab] head:\n{txt[:1500]}\n--- [truncated len={len(txt)}] ---", flush=True)
@@ -1456,12 +1598,10 @@ def prepopulate_edna_from_districts(xlsx_path: str, sheets: list[str], delay_sec
                         pass
 
                 for row in rows:
-                    # ignore the district row itself (branch 0000)
                     if _normalize_space(row.get("branch", "")) == "0000":
                         continue
                     _append_school_row_from_listing(inst_name, _digits_only(district7), row, session, referer_url)
 
-                # Next page?
                 try:
                     nxt = _paginate_next(session, referer_url, schools_soup)
                 except Exception as e:
@@ -1480,13 +1620,11 @@ def prepopulate_edna_from_districts(xlsx_path: str, sheets: list[str], delay_sec
 # ==============================
 def main():
     try:
-        # Ensure output file exists before reading
         _ensure_output_csv_exists()
 
-        # 2) Open workbook (preserves formatting/validations)
         wb = load_workbook(CMP_FILENAME)
 
-        # Prepopulate edna_output.csv with all schools by district ***
+        # Prepopulate cache (now includes Grades)
         try:
             prepopulate_edna_from_districts(CMP_FILENAME, CMP_SHEETS, delay_sec=0.6)
         except Exception as e:
@@ -1494,40 +1632,52 @@ def main():
             traceback.print_exc()
 
         # RELOAD LOOKUP *after* prepopulation
-        lookup = pd.read_csv(OUTPUT_CSV_FILENAME, dtype=str).fillna("")
+        lookup = pd.read_csv(EDNA_CACHE_CSV, dtype=str).fillna("")
         ensure_headers(
             lookup,
             ["School Name", "District Name", "NCES 12-digit (District+Branch)"],
             "output.csv"
         )
-        rows12, rowsDist7 = [], []
+        # Ensure 'Grades' column exists for downstream mapping
+        if "Grades" not in lookup.columns:
+            lookup["Grades"] = ""
+            
+        rows12, rowsDist7, rowsGrades = [], [], []
         for _, r in lookup.iterrows():
             k = _pair_key(r.get("School Name",""), r.get("District Name",""))
             code12 = _digits_only(r.get("NCES 12-digit (District+Branch)",""))
             dist7_csv = _digits_only(r.get("District NCES",""))
+            grades = r.get("Grades", "") or ""
             if code12:
                 rows12.append((k, code12))
                 rowsDist7.append((k, dist7_csv if len(dist7_csv)==7 else _derive_district7_from_12(code12)))
+                rowsGrades.append((k, grades))
 
         pair_to_nces12 = dict(rows12)
         pair_to_dist7  = dict(rowsDist7)
+        pair_to_grades = dict(rowsGrades)
 
         # 3) Process each sheet
         for sheet in CMP_SHEETS:
             print(f"Processing sheet: {sheet}")
 
-            # Read via pandas
             df = pd.read_excel(CMP_FILENAME, sheet_name=sheet, dtype=str).fillna("")
             df.rename(columns=lambda c: c.strip() if isinstance(c, str) else c, inplace=True)
 
-            # Ensure required columns and initialize writeback columns if missing
             ensure_headers(df, ["School Name", "District Name"], f"{sheet}")
             if "School Number (NCES)" not in df.columns:
                 df["School Number (NCES)"] = ""
             if "District Number (NCES)" not in df.columns:
                 df["District Number (NCES)"] = ""
+            if "Grade Band" not in df.columns:
+                df["Grade Band"] = ""
+                
+            if sheet == "School Pop. Data":
+                if "Lowest Grade Level Served" not in df.columns:
+                    df["Lowest Grade Level Served"] = ""
+                if "Highest Grade Level Served" not in df.columns:
+                    df["Highest Grade Level Served"] = ""                        
 
-            # 4) Match each row
             for idx, row in tqdm(df.iterrows(), total=len(df), desc=f"Matching names in {sheet}"):
                 school = row.get("School Name", "")
                 district = row.get("District Name", "")
@@ -1541,30 +1691,58 @@ def main():
                 nces12 = pair_to_nces12.get(key, "")
                 if nces12:
                     df.at[idx, "School Number (NCES)"]   = nces12
-                    # Prefer explicit district7 mapping; else derive from the 12-digit
                     dist7 = pair_to_dist7.get(key, "") or _derive_district7_from_12(nces12)
                     df.at[idx, "District Number (NCES)"] = dist7
+                    
+                    # Grade band from cache if available
+                    gb = pair_to_grades.get(key, "")
+                    if gb:
+                        df.at[idx, "Grade Band"] = gb
+
+                    # If we're on the School Pop. Data sheet, derive min/max
+                    if sheet == "School Pop. Data":
+                        tokens = _parse_grade_tokens(df.at[idx, "Grade Band"])
+                        lo, hi = _lowest_highest_from_tokens(tokens)
+                        if lo:
+                            df.at[idx, "Lowest Grade Level Served"] = lo
+                        if hi:
+                            df.at[idx, "Highest Grade Level Served"] = hi
+                            
                     continue
 
-                # No exact match: log and try online
                 print(f"[INFO] No exact match for row {idx+2} in '{sheet}': "
                       f"School='{norm(school)}', District='{norm(district)}'")
 
-                # ---- Online lookup on EDNA (by school name; require exact district)
+                # ---- Online lookup by name (returns grades now)
                 web_row = edna_lookup_by_name(norm(school), norm(district), delay_sec=0.6)
                 if web_row and (web_row.get("NCES 12-digit (District+Branch)") or web_row.get("NCES Code")):
                     code12 = _digits_only(web_row.get("NCES 12-digit (District+Branch)", "")) or _digits_only(web_row.get("NCES Code", ""))
                     dist7  = _digits_only(web_row.get("District NCES", "")) or _derive_district7_from_12(code12)
+                    grades = web_row.get("Grades", "") or ""
                     df.at[idx, "School Number (NCES)"]   = code12
                     df.at[idx, "District Number (NCES)"] = dist7
+
+                    if grades:
+                        df.at[idx, "Grade Band"] = grades
+                        
+                    # If we're on the School Pop. Data sheet, derive min/max
+                    if sheet == "School Pop. Data":
+                        tokens = _parse_grade_tokens(df.at[idx, "Grade Band"])
+                        lo, hi = _lowest_highest_from_tokens(tokens)
+                        if lo:
+                            df.at[idx, "Lowest Grade Level Served"] = lo
+                        if hi:
+                            df.at[idx, "Highest Grade Level Served"] = hi                         
+
                     try:
                         _append_if_new(web_row)
                     except Exception as e:
                         print(f"[online-append/name] {e}")
-                        traceback.print_exc()
+                        traceback.print_exc() 
+                            
                     continue
 
-                # ---- Fallback by LOCATION_ID (EDNA SchoolBranch)
+                # ---- Fallback by LOCATION_ID (returns grades now)
                 loc_candidates = [
                     row.get("LOCATION_ID", ""),
                     row.get("Location ID", ""),
@@ -1582,8 +1760,22 @@ def main():
                     if web_row_loc and (web_row_loc.get("NCES 12-digit (District+Branch)") or web_row_loc.get("NCES Code")):
                         code12 = _digits_only(web_row_loc.get("NCES 12-digit (District+Branch)", "")) or _digits_only(web_row_loc.get("NCES Code", ""))
                         dist7  = _digits_only(web_row_loc.get("District NCES", "")) or _derive_district7_from_12(code12)
+                        grades = web_row_loc.get("Grades", "") or ""
                         df.at[idx, "School Number (NCES)"]   = code12
                         df.at[idx, "District Number (NCES)"] = dist7
+                        
+                        if grades:
+                            df.at[idx, "Grade Band"] = grades
+
+                        # If we're on the School Pop. Data sheet, derive min/max
+                        if sheet == "School Pop. Data":
+                            tokens = _parse_grade_tokens(df.at[idx, "Grade Band"])
+                            lo, hi = _lowest_highest_from_tokens(tokens)
+                            if lo:
+                                df.at[idx, "Lowest Grade Level Served"] = lo
+                            if hi:
+                                df.at[idx, "Highest Grade Level Served"] = hi                            
+                            
                         try:
                             _append_if_new(web_row_loc)
                         except Exception as e:
@@ -1591,23 +1783,34 @@ def main():
                             traceback.print_exc()
                         continue
 
-                # ---- Optional fuzzy fallback (kept as-is; only fills School Number)
-                # NOTE: If enabled and used, we also derive District Number from the chosen 12-digit.
+                # ---- Optional fuzzy fallback
                 if ENABLE_FUZZY_MATCH and pair_to_nces12:
-                    # Fuzzy over keys we have in CSV
                     csv_keys = list(pair_to_nces12.keys())
                     best_match, score = _extract_one(key, csv_keys)
                     if best_match and score >= FUZZY_THRESHOLD:
                         code12 = pair_to_nces12.get(best_match, "")
                         df.at[idx, "School Number (NCES)"]   = code12
                         df.at[idx, "District Number (NCES)"] = pair_to_dist7.get(best_match, "") or _derive_district7_from_12(code12)
+                        gb = pair_to_grades.get(best_match, "")
+                        
+                        if gb:
+                            df.at[idx, "Grade Band"] = gb
+                            
+                        if sheet == "School Pop. Data":
+                            tokens = _parse_grade_tokens(df.at[idx, "Grade Band"])
+                            lo, hi = _lowest_highest_from_tokens(tokens)
+                            if lo:
+                                df.at[idx, "Lowest Grade Level Served"] = lo
+                            if hi:
+                                df.at[idx, "Highest Grade Level Served"] = hi                            
+                            
                         print(f"[FUZZY] Using fuzzy match (score {score:.1f}) → {best_match}")
                         continue
 
                 print(f"[WARN] No match found for row {idx+2} in '{sheet}': "
                       f"School='{norm(school)}', District='{norm(district)}'")
 
-            # 5) Write NCES back to THIS sheet now (both School and District)
+            # 5) Write NCES + Grade Band back to THIS sheet now
             ws = wb[sheet]
             header_to_col = build_header_map(ws)
 
@@ -1619,23 +1822,47 @@ def main():
                 col_idx = len(header_to_col) + 1
                 ws.cell(row=1, column=col_idx, value="District Number (NCES)")
                 header_to_col["District Number (NCES)"] = col_idx
+            if "Grade Band" not in header_to_col:
+                col_idx = len(header_to_col) + 1
+                ws.cell(row=1, column=col_idx, value="Grade Band")
+                header_to_col["Grade Band"] = col_idx
 
+            # Only for School Pop. Data: ensure Lowest/Highest columns in the sheet
+            if sheet == "School Pop. Data":
+                if "Lowest Grade Level Served" not in header_to_col:
+                    col_idx = len(header_to_col) + 1
+                    ws.cell(row=1, column=col_idx, value="Lowest Grade Level Served")
+                    header_to_col["Lowest Grade Level Served"] = col_idx
+                if "Highest Grade Level Served" not in header_to_col:
+                    col_idx = len(header_to_col) + 1
+                    ws.cell(row=1, column=col_idx, value="Highest Grade Level Served")
+                    header_to_col["Highest Grade Level Served"] = col_idx
+
+            # ---- Column indices ----
             nces_school_col   = header_to_col["School Number (NCES)"]
             nces_district_col = header_to_col["District Number (NCES)"]
+            grade_band_col    = header_to_col["Grade Band"]
+            low_col = header_to_col.get("Lowest Grade Level Served")
+            high_col = header_to_col.get("Highest Grade Level Served")
 
-            # Ensure Excel treats these as text (preserve leading zeros)
+            # ---- Force text for NCES columns ----
             for col_idx in (nces_school_col, nces_district_col):
                 for r in range(2, len(df) + 2):
                     ws.cell(row=r, column=col_idx).number_format = "@"
 
-            # Write values
-            for r in tqdm(range(len(df)), total=len(df), desc=f"Writing NCES in {sheet}", leave=False):
+            # ---- Write values ----
+            for r in tqdm(range(len(df)), total=len(df), desc=f"Writing outputs in {sheet}", leave=False):
                 excel_row = r + 2
                 ws.cell(row=excel_row, column=nces_school_col,   value=df.iloc[r]["School Number (NCES)"])
                 ws.cell(row=excel_row, column=nces_district_col, value=df.iloc[r]["District Number (NCES)"])
+                ws.cell(row=excel_row, column=grade_band_col,    value=df.iloc[r]["Grade Band"])
+                if sheet == "School Pop. Data":
+                    if low_col:
+                        ws.cell(row=excel_row, column=low_col,  value=df.iloc[r]["Lowest Grade Level Served"])
+                    if high_col:
+                        ws.cell(row=excel_row, column=high_col, value=df.iloc[r]["Highest Grade Level Served"])
 
-        # 6) Save updated workbook once after all sheets are written
-        out_name = "CMP Data Template (long format)_PA - Updated.xlsx"
+        out_name = OUTPUT_FILENAME
         wb.save(out_name)
         print(f"File saved as '{out_name}'")
 

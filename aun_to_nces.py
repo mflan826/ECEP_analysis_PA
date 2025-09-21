@@ -21,6 +21,18 @@ import html
 from urllib.parse import urlparse
 from tqdm.auto import tqdm
 import os
+import yaml
+
+try:
+    with open('config.yaml', 'r') as f:
+        config = yaml.safe_load(f)
+except Exception as e:
+    print(f"[config] Failed to load config.yaml: {e}")
+    traceback.print_exc()
+    raise
+    
+file_path_prefix       = config['file_path_prefix']
+edna_cache             = f"{file_path_prefix}/{config['edna_cache']}"    
 
 # Build per-AUN (+ SchoolBranch) search URLs
 SEARCH_URL_TEMPLATE = (
@@ -266,6 +278,158 @@ def _find_table_with_header(soup: BeautifulSoup, header_name: str) -> Tuple[Opti
                 return table, idx, header_row
     return None, None, None
 
+def extract_grades_from_details(soup: BeautifulSoup) -> str:
+    """
+    Locate the 'Grades' table on the details page and return a comma-separated
+    list of grade tokens found there. Handles common variants and falls back
+    gracefully if the table structure differs slightly.
+
+    Returns "" if nothing can be found.
+    """
+    try:
+        # First, prefer a table that explicitly has a header column named 'Grades'
+        table, grades_col_idx, header_row = _find_table_with_header(soup, "Grades")
+
+        # If not found, try finding a heading titled 'Grades' and then the next table
+        if not table or grades_col_idx is None:
+            heading = None
+            for tag_name in ["h1", "h2", "h3", "h4", "h5", "h6", "strong"]:
+                for h in soup.find_all(tag_name):
+                    if normalize_space(h.get_text()).lower() == "grades":
+                        heading = h
+                        break
+                if heading:
+                    break
+
+            if heading:
+                # Find the next table after the heading
+                nxt = heading.find_next(["table"])
+                if nxt:
+                    # Try to locate the 'Grades' column in that table (if present)
+                    # otherwise we'll treat the whole row text as the source of tokens.
+                    t_headers_row = None
+                    for tr in nxt.find_all("tr", recursive=True):
+                        if tr.find("th") or tr.find_all("td"):
+                            t_headers_row = tr
+                            break
+                    grades_col_idx = None
+                    if t_headers_row:
+                        headers = _table_header_texts(t_headers_row)
+                        for idx, h in enumerate(headers):
+                            if normalize_space(h).lower() == "grades":
+                                grades_col_idx = idx
+                                break
+                    table = nxt
+                    header_row = t_headers_row
+
+        if not table:
+            return ""
+
+        # Collect data rows (similar approach to NCES extraction)
+        tbody = table.find("tbody")
+        data_rows = []
+        if tbody:
+            for tr in tbody.find_all("tr"):
+                if tr.find("th"):
+                    continue
+                if tr.find_all("td"):
+                    data_rows.append(tr)
+        else:
+            # Walk following TR siblings after the header row, bounded by table
+            if header_row:
+                for tr in header_row.find_all_next("tr"):
+                    if tr.find_parent("table") != table:
+                        break
+                    if tr.find("th"):
+                        continue
+                    if tr.find_all("td"):
+                        data_rows.append(tr)
+            else:
+                # No recognizable header; take all tr with td under the table
+                for tr in table.find_all("tr", recursive=True):
+                    if tr.find_all("td"):
+                        data_rows.append(tr)
+
+        if not data_rows:
+            return ""
+
+        # Extract tokens from either the explicit 'Grades' column or entire row text
+        tokens = []
+        for tr in data_rows:
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+
+            cell_text = ""
+            if grades_col_idx is not None and grades_col_idx < len(tds):
+                cell_text = normalize_space(tds[grades_col_idx].get_text(" ", strip=True))
+            else:
+                # Fallback: use all td text in the row
+                cell_text = normalize_space(tr.get_text(" ", strip=True))
+
+            # Collect grade-like tokens: PK, K, and integers (1–12+ just in case)
+            row_tokens = re.findall(r"\b(?:PK|K|\d{1,2})\b", cell_text, flags=re.IGNORECASE)
+            # Normalize casing for PK/K
+            row_tokens = [t.upper() if t.upper() in ("PK", "K") else t for t in row_tokens]
+            tokens.extend(row_tokens)
+
+        if not tokens:
+            return ""
+
+        # Deduplicate with stable order, but finally sort semantically (PK, K, 1..12..)
+        def _semantic_sort(unique_tokens: list) -> list:
+            # Keep only valid grade tokens
+            u = []
+            seen = set()
+            for t in unique_tokens:
+                if t in ("PK", "K"):
+                    key = t
+                else:
+                    # filter to numeric grades that parse as int
+                    try:
+                        _ = int(t)
+                    except Exception:
+                        continue
+                    key = t
+                if key not in seen:
+                    seen.add(key)
+                    u.append(key)
+
+            # Partition
+            has_pk = "PK" in u
+            has_k = "K" in u
+            nums = []
+            for t in u:
+                if t not in ("PK", "K"):
+                    try:
+                        nums.append(int(t))
+                    except Exception:
+                        pass
+            nums = sorted(set(nums))
+            out = []
+            if has_pk:
+                out.append("PK")
+            if has_k:
+                out.append("K")
+            out.extend(str(n) for n in nums)
+            return out
+
+        # Preserve discovery order first (for dedupe), then semantic order
+        dedup_in_order = []
+        seen = set()
+        for t in tokens:
+            if t not in seen:
+                seen.add(t)
+                dedup_in_order.append(t)
+
+        final_tokens = _semantic_sort(dedup_in_order)
+        return ", ".join(final_tokens)
+
+    except Exception as e:
+        print(f"[grades-extract] {e}")
+        traceback.print_exc()
+        return ""
+
 def get_district_info(aun: str, base_url: str = BASE_URL, delay_sec: float = 0.6) -> Tuple[str, str]:
     """
     For a given AUN, fetch the district (SchoolBranch=0000) and return (district_name, district_nces_raw).
@@ -355,13 +519,19 @@ def build_full_nces_code(district_nces: str, school_branch: str) -> str:
     
 def attach_district_columns(rows: list, district_name: str, district_nces_raw: str) -> list:
     """
-    Append district name, district NCES, and a derived 12-digit NCES (district+branch).
+    Given rows shaped like:
+        [School Name, School/Branch, NCES Code, Grades, Detail URL]
+    append district name, district NCES, and the derived 12-digit NCES.
+
+    Returns rows shaped like:
+        [School Name, School/Branch, NCES Code, Grades, Detail URL,
+         District Name, District NCES, NCES 12-digit (District+Branch)]
     """
     out = []
     district_nces_for_csv = f'="{district_nces_raw}"' if district_nces_raw else ""
     for r in rows:
-        # r: [school_name, school_branch, school_nces, detail_url]
-        school_branch = r[1]
+        # r: [school_name, school_branch, nces, grades, detail_url]
+        school_branch = r[1] if len(r) > 1 else ""
         full_12digit = build_full_nces_code(district_nces_raw, school_branch)
         out.append(r + [district_name, district_nces_for_csv, full_12digit])
     return out
@@ -429,7 +599,7 @@ def apply_school_branch(rows: list, school_branch_value: str) -> list:
 def scrape(search_url: str, requested_branch: Optional[str] = None, base_url: str = BASE_URL, delay_sec: float = 0.6):
     """
     Return rows from a single EDNA results page:
-      [School Name(from results page), School/Branch(from results page), NCES Code(from details), Detail URL]
+      [School Name(from results page), School/Branch(from results page), NCES Code(from details), Grades(from details), Detail URL]
 
     If requested_branch is provided, only include rows whose 'School/Branch' cell
     exactly matches requested_branch (when the column exists).
@@ -441,14 +611,14 @@ def scrape(search_url: str, requested_branch: Optional[str] = None, base_url: st
         resp = session.get(search_url)
         resp.raise_for_status()
     except Exception as e:
-        print(f"[fetch-search] {e}", file=sys.stderr)
+        print(f"[fetch-search] {e}")
         traceback.print_exc()
         return rows
 
     soup = BeautifulSoup(resp.text, "html.parser")
     table, inst_col_idx, branch_col_idx = find_results_table_and_institution_col(soup)
     if table is None or inst_col_idx is None:
-        print("[parse-search] Could not locate results table or 'Institution Name' column.", file=sys.stderr)
+        print("[parse-search] Could not locate results table or 'Institution Name' column.")
         return rows
 
     tbody = table.find("tbody") or table
@@ -467,7 +637,7 @@ def scrape(search_url: str, requested_branch: Optional[str] = None, base_url: st
 
         raw_href = a["href"].strip()
         school_name = normalize_space(a.get_text(" ", strip=True))  # <-- authoritative name source
-        
+
         if not raw_href or not school_name:
             continue
 
@@ -481,9 +651,10 @@ def scrape(search_url: str, requested_branch: Optional[str] = None, base_url: st
             continue
 
         nces = ""
+        grades = ""
         detail_url_for_csv = ""
 
-        # Visit the details page strictly to extract NCES
+        # Visit the details page to extract NCES + Grades
         try:
             time.sleep(delay_sec)
             if not raw_href.lower().startswith("javascript:"):
@@ -493,33 +664,42 @@ def scrape(search_url: str, requested_branch: Optional[str] = None, base_url: st
                 dr.raise_for_status()
                 dsoup = BeautifulSoup(dr.text, "html.parser")
                 nces = extract_nces_code_from_details(dsoup)
+                grades = extract_grades_from_details(dsoup)
                 if not nces:
-                    print(f"[warn-nces-missing] {detail_url}", file=sys.stderr)
+                    print(f"[warn-nces-missing] {detail_url}")
+                if not grades:
+                    # Not fatal; some entities may omit the section or have nonstandard markup
+                    print(f"[warn-grades-missing] {detail_url}")
             else:
                 parsed = parse_postback_href(raw_href)
                 if not parsed:
-                    print(f"[warn-postback-parse] Could not parse postback href: {raw_href}", file=sys.stderr)
+                    print(f"[warn-postback-parse] Could not parse postback href: {raw_href}")
                 else:
                     target, argument = parsed
                     dsoup = do_postback(session, search_url, target, argument)
                     if dsoup is None:
-                        print(f"[warn-postback-failed] target={target} argument={argument}", file=sys.stderr)
+                        print(f"[warn-postback-failed] target={target} argument={argument}")
                     else:
                         detail_url_for_csv = ""  # canonical URL unknown for postback
                         nces = extract_nces_code_from_details(dsoup)
+                        grades = extract_grades_from_details(dsoup)
                         if not nces:
-                            print(f"[warn-nces-missing-postback] target={target} argument={argument}", file=sys.stderr)
+                            print(f"[warn-nces-missing-postback] target={target} argument={argument}")
+                        if not grades:
+                            print(f"[warn-grades-missing-postback] target={target} argument={argument}")
         except KeyboardInterrupt:
-            print("[fetch-details] KeyboardInterrupt in detail retrieval loop", file=sys.stderr)
+            print("[fetch-details] KeyboardInterrupt in detail retrieval loop")
             traceback.print_exc()
             raise
         except Exception as e:
-            print(f"[fetch-details] {raw_href} :: {e}", file=sys.stderr)
+            print(f"[fetch-details] {raw_href} :: {e}")
             traceback.print_exc()
 
         nces_for_csv = f'="{nces}"' if nces else ""
         school_branch_for_csv = f'="{school_branch}"' if school_branch else ""
-        rows.append([school_name, school_branch_for_csv, nces_for_csv, detail_url_for_csv])
+        grades_for_csv = grades  # plain string like "9, 10, 11, 12"
+
+        rows.append([school_name, school_branch_for_csv, nces_for_csv, grades_for_csv, detail_url_for_csv])
 
     return rows
 
@@ -528,12 +708,11 @@ def main():
     parser.add_argument("input_csv", help="Path to input CSV file containing AUN values and SchoolBranch values.")
     parser.add_argument("aun_column", help="Name of the column in the input CSV that contains AUN numbers.")
     parser.add_argument("school_branch_column", help="Name of the column in the input CSV that contains School/Branch values to copy into the output.")
-    parser.add_argument("output_csv", help="Path to write a single combined CSV of results.")
     parser.add_argument("--delay", type=float, default=0.6, help="Delay (seconds) between detail page requests. Default: 0.6")
     args = parser.parse_args()
 
     input_path = Path(args.input_csv)
-    output_path = Path(args.output_csv)
+    output_path = Path(edna_cache)
 
     if not input_path.exists():
         print(f"[main] Input CSV not found: {input_path}", file=sys.stderr)
@@ -592,6 +771,7 @@ def main():
         "School Name",
         "School/Branch",
         "NCES Code",
+        "Grades",
         "Detail URL",
         "District Name",
         "District NCES",

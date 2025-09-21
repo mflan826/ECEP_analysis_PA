@@ -9,35 +9,29 @@ SELECT
    demographics."District Number (NCES)" AS "District Number (NCES)",
    courselist.Category AS "Category",
 
-   COUNT(CASE 
-            WHEN course.STUDENT_GENDER_CD = 'M' AND courselist.Level = 'Basic'
-            THEN 1 
-        END) AS "Basic_Boy",
+   SUM(CASE 
+         WHEN course.STUDENT_GENDER_CD = 'M' AND courselist.Level = 'Basic'
+         THEN course.N ELSE 0 END) AS "Basic_Boy",
 
-   COUNT(CASE 
-            WHEN course.STUDENT_GENDER_CD = 'F' AND courselist.Level = 'Basic'
-            THEN 1 
-        END) AS "Basic_Girl",
+   SUM(CASE 
+         WHEN course.STUDENT_GENDER_CD = 'F' AND courselist.Level = 'Basic'
+         THEN course.N ELSE 0 END) AS "Basic_Girl",
 
-   COUNT(CASE 
-            WHEN course.STUDENT_GENDER_CD = 'M' AND courselist.Level = 'Advanced'
-            THEN 1 
-        END) AS "Adv_Boy",
+   SUM(CASE 
+         WHEN course.STUDENT_GENDER_CD = 'M' AND courselist.Level = 'Advanced'
+         THEN course.N ELSE 0 END) AS "Adv_Boy",
 
-   COUNT(CASE 
-            WHEN course.STUDENT_GENDER_CD = 'F' AND courselist.Level = 'Advanced'
-            THEN 1 
-        END) AS "Adv_Girl",
+   SUM(CASE 
+         WHEN course.STUDENT_GENDER_CD = 'F' AND courselist.Level = 'Advanced'
+         THEN course.N ELSE 0 END) AS "Adv_Girl",
 
-   COUNT(CASE 
-            WHEN course.STUDENT_GENDER_CD IN ('M', 'F') AND courselist.Level = 'Basic'
-            THEN 1 
-        END) AS "Basic_Total",
+   SUM(CASE 
+         WHEN course.STUDENT_GENDER_CD IN ('M', 'F') AND courselist.Level = 'Basic'
+         THEN course.N ELSE 0 END) AS "Basic_Total",
         
-   COUNT(CASE 
-            WHEN course.STUDENT_GENDER_CD IN ('M', 'F') AND courselist.Level = 'Advanced'
-            THEN 1 
-        END) AS "Adv_Total",
+   SUM(CASE 
+         WHEN course.STUDENT_GENDER_CD IN ('M', 'F') AND courselist.Level = 'Advanced'
+         THEN course.N ELSE 0 END) AS "Adv_Total",
         
    COUNT(DISTINCT CASE 
                      WHEN courselist.Level = 'Basic'

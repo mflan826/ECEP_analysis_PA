@@ -7,6 +7,7 @@ import io
 import yaml
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 # Load configuration from YAML
 with open('config.yaml', 'r') as f:
@@ -79,18 +80,23 @@ def main():
     # Process files in parallel (read only)
     with ThreadPoolExecutor(max_workers=64) as executor:
         futures = [executor.submit(process_file, file_path) for file_path in files]
-        for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                table_name, df = result
-                table_data[table_name] = df
+        with tqdm(total=len(futures), desc="Reading Excel files", unit="file") as pbar:
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    table_name, df = result
+                    table_data[table_name] = df
+                pbar.update(1)
 
     # Write results to database sequentially (avoids locking)
     conn = sqlite3.connect(db_file)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("BEGIN TRANSACTION")
 
-    for table_name, df in table_data.items():
+    for table_name, df in tqdm(table_data.items(),
+                               total=len(table_data),
+                               desc="Writing tables to SQLite",
+                               unit="table"):
         df.to_sql(table_name, conn, if_exists="replace", index=False, chunksize=1000)
 
     conn.commit()
