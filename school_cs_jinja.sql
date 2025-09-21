@@ -7,6 +7,8 @@ SELECT
    course.PDECOURSENAME AS "Course Name",   
    demographics."School Number (NCES)" AS "School Number (NCES)",
    demographics."District Number (NCES)" AS "District Number (NCES)",
+   demographics."Lowest Grade Level Served" AS "Lowest Grade Level Served",
+   demographics."Highest Grade Level Served" AS "Highest Grade Level Served",   
    courselist.Category AS "Category",
 
    SUM(CASE 
@@ -63,4 +65,6 @@ GROUP BY
    demographics.DISTRICT_NAME,
    demographics."School Number (NCES)",
    demographics."District Number (NCES)",
+   demographics."Lowest Grade Level Served",
+   demographics."Highest Grade Level Served",   
    courselist.Category
