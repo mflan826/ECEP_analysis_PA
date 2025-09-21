@@ -10,6 +10,9 @@ from bs4 import BeautifulSoup, Tag
 import os
 import yaml
 
+# ==============================
+# Config
+# ==============================
 try:
     with open('config.yaml', 'r') as f:
         config = yaml.safe_load(f)
@@ -18,15 +21,27 @@ except Exception as e:
     traceback.print_exc()
     raise
 
-# ==============================
-# Configuration
-# ==============================
-file_path_prefix       = config['file_path_prefix']
-CMP_FILENAME = f"{file_path_prefix}/CMP_Data_Populated.xlsx"
+file_path_prefix = config['file_path_prefix']
+CMP_FILENAME    = f"{file_path_prefix}/CMP_Data_Populated.xlsx"
 OUTPUT_FILENAME = f"{file_path_prefix}/CMP_Data_Populated - Updated.xlsx"
-EDNA_CACHE_CSV = f"{file_path_prefix}/{config['edna_cache']}"
+EDNA_CACHE_CSV  = f"{file_path_prefix}/{config['edna_cache']}"
+
+# Sheet names (keep your defaults)
 CMP_SHEETS = ["School Pop. Data", "School CS Data"]
-ENABLE_FUZZY_MATCH = False   # set to False to disable fuzzy matching
+
+# Output column names used in the workbook (configurable)
+OUT_SCHOOL_NAME   = config.get('output_school_name_col',  "School Name")
+OUT_DISTRICT_NAME = config.get('output_district_name_col',"District Name")
+OUT_SCHOOL_NCES   = config.get('output_school_id_col',    "School Number (NCES)")
+OUT_DISTRICT_NCES = config.get('output_district_id_col',  "District Number (NCES)")
+OUT_LOW_GRADE     = config.get('output_low_grade_band_col',"Lowest Grade Level Served")
+OUT_HIGH_GRADE    = config.get('output_high_grade_band_col',"Highest Grade Level Served")
+
+# Optional configurable name for a Grades column (used only to derive low/high if blanks)
+GRADES_COL = config.get('grades_col_name', 'Grades')
+
+# Matching knob
+ENABLE_FUZZY_MATCH = False   # set to True if you want fuzzy fallback
 
 # ==============================
 # Exact-match only by default; fuzzy fallback
@@ -73,58 +88,8 @@ def _normalize_strict(s: str) -> str:
 def _district_equals(a: str, b: str) -> bool:
     return _normalize_strict(a) == _normalize_strict(b)
 
-def _normalize_detail_url(href_or_url: str) -> str:
-    try:
-        s = (href_or_url or "").strip()
-        if not s:
-            return s
-        lower = s.lower()
-        if "wfinstitutiondetails.aspx" in lower:
-            try:
-                from urllib.parse import urlparse
-                p = urlparse(s)
-                if p.scheme and p.netloc:
-                    s = p.path + (("?" + p.query) if p.query else "")
-            except Exception:
-                pass
-            if not s.startswith("/"):
-                s = "/" + s
-            if not s.lower().startswith("/screens/"):
-                s = "/Screens" + s
-            s = s.replace("//", "/")
-            s = s.replace("/Screens/Screens/", "/Screens/")
-        return s
-    except Exception:
-        traceback.print_exc()
-        return href_or_url
-
-def _force_screens_url(url_or_href: str) -> str:
-    s = (url_or_href or "").strip()
-    if not s:
-        return s
-    low = s.lower()
-    if "wfinstitutiondetails.aspx" not in low:
-        return s
-    try:
-        from urllib.parse import urlparse
-        p = urlparse(s)
-        if p.scheme and p.netloc:
-            s = p.path + (("?" + p.query) if p.query else "")
-    except Exception:
-        pass
-    if not s.startswith("/"):
-        s = "/" + s
-    if not s.lower().startswith("/screens/"):
-        s = "/Screens" + s
-    s = s.replace("//", "/").replace("/Screens/Screens/", "/Screens/")
-    return urljoin(EDNA_BASE, s)
-
 def _pair_key(school: str, district: str) -> str:
     return f"{_normalize_strict(school)}||{_normalize_strict(district)}"
-
-def _derive_district7_from_12(nces12: str) -> str:
-    d = _digits_only(nces12)
-    return d[:7] if len(d) >= 7 else ""
 
 def _extract_one(query: str, choices: list[str]):
     if _USE_RAPIDFUZZ:
@@ -140,32 +105,36 @@ def _extract_one(query: str, choices: list[str]):
     else:
         return None, 0.0
 
+def _is_blank(v) -> bool:
+    return (v is None) or (str(v).strip() == "")
+
+def _backfill(df: pd.DataFrame, idx: int, col: str, value: str):
+    """Only write value if the current cell is blank (don’t overwrite SQL-populated fields)."""
+    if not _is_blank(value):
+        cur = df.at[idx, col] if col in df.columns else ""
+        if _is_blank(cur):
+            df.at[idx, col] = value
+
 # ==============================
 # Grade parsing helpers (used for BOTH sheets)
 # ==============================
 _GRADE_RANK = {"PK": 0, "K": 1}
-_GRADE_RANK.update({str(i): i for i in range(1, 13)})  # For min/max comparisons from 'Grades' column
+_GRADE_RANK.update({str(i): i for i in range(1, 13)})
 
 def _parse_grade_tokens(grades_str: str) -> list[str]:
-    """
-    Parse a 'Grades' string like '1,2,3,4,5' or 'PK,K,1,2' (case-insensitive).
-    Recognizes PK, K, 1..12. Returns deduped canonical tokens in input order.
-    """
     if not grades_str:
         return []
-    # split on commas/semicolons, trim whitespace
     parts = [p.strip() for p in re.split(r"[;,]", str(grades_str)) if p.strip()]
     tokens = []
     seen = set()
     for p in parts:
-        # accept PK, K, or integers (possibly with leading zeros)
         m = re.fullmatch(r"(?i)PK|K|\d{1,2}", p)
         if not m:
             continue
         t = p.upper()
         if t not in ("PK", "K"):
             try:
-                t = str(int(t))  # canonicalize "01" -> "1"
+                t = str(int(t))
             except Exception:
                 continue
         if t not in seen:
@@ -178,12 +147,10 @@ def _lowest_highest_from_tokens(tokens: list[str]) -> tuple[str, str]:
     if not ranked:
         return "", ""
     ranked.sort(key=lambda x: x[1])
-    lo = ranked[0][0]
-    hi = ranked[-1][0]
-    return lo, hi
+    return ranked[0][0], ranked[-1][0]
 
 # ==============================
-# Edna Lookup (unchanged except where noted)
+# EDNA helpers (unchanged logic)
 # ==============================
 EDNA_BASE = "http://www.edna.pa.gov"
 CURRENTNAME_SEARCH_TEMPLATE = (
@@ -193,7 +160,6 @@ CURRENTNAME_SEARCH_TEMPLATE = (
     "46%2c47%2c40%2c34%2c56%2c45%2c36%2c44%2c35%2c38%2c59%2c999%2c32%2c33%2c37%2c49%2c57%2c52%2c22%2c20%2c19%2c58%2c53%2c"
     "3%2c4%2c2%2c1%2c6%2c7%2c29%2c27%2c28%2c55%2c30%2c31%2c14%2c11%2c12%2c9%2c17%2c15%2c18%2c46%2c47%2c40%2c34%2c56%2c45%2c36%2c44%2c35%2c38%2c59%2c999%2c32%2c33%2c37%2c49%2c57%2c52%2c22%2c20%2c19%2c58%2c53%2c&StatusIDs=1%2c"
 )
-
 SCHOOLBRANCH_SEARCH_TEMPLATE = (
     "http://www.edna.pa.gov/Screens/wfSearchEntityResults.aspx?"
     "AUN=&SchoolBranch={BRANCH}&CurrentName=&City=&HistoricalName=&IU=-1&CID=-1&"
@@ -219,6 +185,51 @@ def _make_session() -> requests.Session:
         return orig(method, url, **kwargs)
     s.request = wrapped
     return s
+
+def _normalize_detail_url(href_or_url: str) -> str:
+    try:
+        s = (href_or_url or "").strip()
+        if not s:
+            return s
+        lower = s.lower()
+        if "wfinstitutiondetails.aspx" in lower:
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(s)
+                if p.scheme and p.netloc:
+                    s = p.path + (("?" + p.query) if p.query else "")
+            except Exception:
+                pass
+            if not s.startswith("/"):
+                s = "/" + s
+            if not s.lower().startswith("/screens/"):
+                s = "/Screens" + s
+            s = s.replace("//", "/").replace("/Screens/Screens/", "/Screens/")
+        return s
+    except Exception:
+        traceback.print_exc()
+        return href_or_url
+
+def _force_screens_url(url_or_href: str) -> str:
+    s = (url_or_href or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    if "wfinstitutiondetails.aspx" not in low:
+        return s
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(s)
+        if p.scheme and p.netloc:
+            s = p.path + (("?" + p.query) if p.query else "")
+    except Exception:
+        pass
+    if not s.startswith("/"):
+        s = "/" + s
+    if not s.lower().startswith("/screens/"):
+        s = "/Screens" + s
+    s = s.replace("//", "/").replace("/Screens/Screens/", "/Screens/")
+    return urljoin(EDNA_BASE, s)
 
 def _currentname_search_url(school_name: str) -> str:
     return CURRENTNAME_SEARCH_TEMPLATE.format(CURRENT=quote_plus((school_name or "").strip()))
@@ -342,7 +353,6 @@ def _find_table_with_header_loose(soup: BeautifulSoup, header_name: str) -> Tupl
     return None, None, None
 
 def _extract_grades_from_details(soup: BeautifulSoup) -> str:
-    # (kept as-is; used for EDNA cache; not written to workbook)
     try:
         def _canon_token(t: str) -> str:
             t = t.strip().upper()
@@ -425,7 +435,7 @@ def _extract_grades_from_details(soup: BeautifulSoup) -> str:
             if label in kv and kv[label]:
                 toks = _tokens_from_text(kv[label])
                 if toks:
-                    return ", ".join(toks)
+                    return ", ".join(tokens)
         for label, value in kv.items():
             if "grade" in label.lower() and value:
                 toks = _tokens_from_text(value)
@@ -436,17 +446,8 @@ def _extract_grades_from_details(soup: BeautifulSoup) -> str:
         traceback.print_exc()
         return ""
 
-def _make_session() -> requests.Session:
-    return requests.Session()  # shadowed earlier; keep headers in the first one
-
-def _search_currentname(session: requests.Session, current_name: str) -> Tuple[List[Tuple[str, str, str]], str]:
-    url = _currentname_search_url(current_name)
-    r = session.get(url); r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    table, inst_idx, branch_idx = _find_results_table_and_institution_col(soup)
-    if not table or inst_idx is None:
-        return [], url
-    return _iter_institution_links(table, inst_idx, branch_idx), url
+def _make_session_simple() -> requests.Session:
+    return requests.Session()
 
 def _find_results_table_and_institution_col(soup: BeautifulSoup) -> Tuple[Optional[Tag], Optional[int], Optional[int]]:
     for table in soup.find_all("table"):
@@ -537,6 +538,15 @@ def _do_postback(session: requests.Session, page_url: str, target: str, argument
         return BeautifulSoup(text, "html.parser")
     return BeautifulSoup(text, "html.parser")
 
+def _search_currentname(session: requests.Session, current_name: str) -> Tuple[List[Tuple[str, str, str]], str]:
+    url = _currentname_search_url(current_name)
+    r = session.get(url); r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    table, inst_idx, branch_idx = _find_results_table_and_institution_col(soup)
+    if not table or inst_idx is None:
+        return [], url
+    return _iter_institution_links(table, inst_idx, branch_idx), url
+
 def _search_schoolbranch(session: requests.Session, branch_code: str) -> Tuple[List[Tuple[str, str, str]], str]:
     branch_code = (branch_code or "").strip()
     branch_code = re.sub(r"\D+", "", branch_code)
@@ -606,7 +616,7 @@ def edna_lookup_by_name(school_name: str, expected_district: str, delay_sec: flo
     expected_district = norm(expected_district)
     if not school_name:
         return None
-    session = requests.Session()
+    session = _make_session_simple()
     try:
         candidates, search_url = _search_currentname(session, school_name)
     except Exception:
@@ -647,7 +657,7 @@ def edna_lookup_by_name(school_name: str, expected_district: str, delay_sec: flo
             "Detail URL": url_for_log,
             "District Name": district_name,
             "District NCES": f'="{district7}"' if district7 else "",
-            "NCES 12-digit (District+Branch)": f'="{nces12}"' if nces12 else "",
+            "NCES 12-digit (District+Branch)": f'=\"{nces12}\"' if nces12 else "",
         }
         print(f"[grades] url={url_for_log} school=\"{inst_name}\" district=\"{district_name}\" branch={branch or '—'} grades=\"{grades or '—'}\"")
         return row
@@ -659,7 +669,7 @@ def edna_lookup_by_location_id(location_id: str, delay_sec: float = 0.6) -> Opti
     if not loc or len(loc) != 4:
         print(f"[grades] url={EDNA_BASE}/Screens/wfSearchEntityResults.aspx school=\"—\" district=\"—\" branch={loc or '—'} grades=\"—\"")
         return None
-    session = requests.Session()
+    session = _make_session_simple()
     try:
         candidates, search_url = _search_schoolbranch(session, loc)
     except Exception:
@@ -706,7 +716,7 @@ def edna_lookup_by_location_id(location_id: str, delay_sec: float = 0.6) -> Opti
     return None
 
 # ==============================
-# EDNA cache helpers
+# EDNA cache helpers (unchanged schema for cache CSV)
 # ==============================
 def _ensure_csv_with_headers(path: str, cols: list[str]):
     if not os.path.exists(path):
@@ -782,15 +792,6 @@ def _append_if_new(web_row: dict):
     print(f"[ONLINE] Replaced Closed/blank row(s) for {web_row['School Name']} / {web_row['District Name']} in {EDNA_CACHE_CSV}")
 
 # ==============================
-# District crawl helpers (trimmed where irrelevant)
-# ==============================
-def _find_table_with_header_loose(soup: BeautifulSoup, header_name: str) -> Tuple[Optional[Tag], Optional[int], Optional[Tag]]:
-    # already defined earlier; kept for completeness (renamed version exists above)
-    return None, None, None  # placeholder to avoid duplicate definitions
-
-# (Omitted: schools listing crawl; unchanged from your version except it still caches Grades.)
-
-# ==============================
 # Main
 # ==============================
 def main():
@@ -799,15 +800,14 @@ def main():
 
         wb = load_workbook(CMP_FILENAME)
 
-        # Optional: prepopulate EDNA cache (unchanged)
+        # (Optional) Prepopulation / crawl hook
         try:
-            # If you still need to run the district crawl, keep your original function here.
             pass
         except Exception as e:
             print(f"[district-prep] {e}")
             traceback.print_exc()
 
-        # RELOAD LOOKUP *after* prepopulation
+        # Reload lookup (EDNA cache)
         lookup = pd.read_csv(EDNA_CACHE_CSV, dtype=str).fillna("")
         ensure_headers(
             lookup,
@@ -825,75 +825,74 @@ def main():
             grades = r.get("Grades", "") or ""
             if code12:
                 rows12.append((k, code12))
-                rowsDist7.append((k, dist7_csv if len(dist7_csv)==7 else _derive_district7_from_12(code12)))
+                rowsDist7.append((k, dist7_csv if len(dist7_csv)==7 else code12[:7]))
                 rowsGrades.append((k, grades))
 
         pair_to_nces12 = dict(rows12)
         pair_to_dist7  = dict(rowsDist7)
         pair_to_grades = dict(rowsGrades)
 
-        # 3) Process each sheet
+        # Process each sheet
         for sheet in CMP_SHEETS:
             print(f"Processing sheet: {sheet}")
 
             df = pd.read_excel(CMP_FILENAME, sheet_name=sheet, dtype=str).fillna("")
             df.rename(columns=lambda c: c.strip() if isinstance(c, str) else c, inplace=True)
 
-            ensure_headers(df, ["School Name", "District Name"], f"{sheet}")
-            if "School Number (NCES)" not in df.columns:
-                df["School Number (NCES)"] = ""
-            if "District Number (NCES)" not in df.columns:
-                df["District Number (NCES)"] = ""
-            # Ensure Lowest/Highest columns on BOTH sheets
-            if "Lowest Grade Level Served" not in df.columns:
-                df["Lowest Grade Level Served"] = ""
-            if "Highest Grade Level Served" not in df.columns:
-                df["Highest Grade Level Served"] = ""
+            # Ensure essential columns exist / are named per config
+            ensure_headers(df, [OUT_SCHOOL_NAME, OUT_DISTRICT_NAME], f"{sheet}")
+
+            if OUT_SCHOOL_NCES not in df.columns:
+                df[OUT_SCHOOL_NCES] = ""
+            if OUT_DISTRICT_NCES not in df.columns:
+                df[OUT_DISTRICT_NCES] = ""
+            if OUT_LOW_GRADE not in df.columns:
+                df[OUT_LOW_GRADE] = ""
+            if OUT_HIGH_GRADE not in df.columns:
+                df[OUT_HIGH_GRADE] = ""
 
             for idx, row in tqdm(df.iterrows(), total=len(df), desc=f"Matching names in {sheet}"):
-                school = row.get("School Name", "")
-                district = row.get("District Name", "")
+                school = row.get(OUT_SCHOOL_NAME, "")
+                district = row.get(OUT_DISTRICT_NAME, "")
                 if not norm(school) or not norm(district):
-                    print(f"[WARN] Missing School or District at row {idx+2} in '{sheet}'")
+                    print(f"[WARN] Missing {OUT_SCHOOL_NAME} or {OUT_DISTRICT_NAME} at row {idx+2} in '{sheet}'")
                     continue
 
                 key = _pair_key(school, district)
 
-                # Prefer Grades from the SHEET (if provided)
-                grades_text_in_sheet = row.get("Grades", "") or ""
+                # Prefer Grades from the SHEET if present (configurable name)
+                grades_text_in_sheet = row.get(GRADES_COL, "") or row.get(GRADES_COL.lower(), "") or ""
 
                 # ---- Exact (local CSV) match on 12-digit
                 nces12 = pair_to_nces12.get(key, "")
                 if nces12:
-                    df.at[idx, "School Number (NCES)"]   = nces12
-                    dist7 = pair_to_dist7.get(key, "") or _derive_district7_from_12(nces12)
-                    df.at[idx, "District Number (NCES)"] = dist7
+                    df.at[idx, OUT_SCHOOL_NCES]   = nces12
+                    dist7 = pair_to_dist7.get(key, "") or nces12[:7]
+                    df.at[idx, OUT_DISTRICT_NCES] = dist7
 
-                    # Resolve 'Grades' to compute min/max (sheet value overrides cache if present)
                     grades_text = grades_text_in_sheet or pair_to_grades.get(key, "")
                     tokens = _parse_grade_tokens(grades_text)
                     lo, hi = _lowest_highest_from_tokens(tokens)
-                    if lo: df.at[idx, "Lowest Grade Level Served"] = lo
-                    if hi: df.at[idx, "Highest Grade Level Served"] = hi
+                    if lo: _backfill(df, idx, OUT_LOW_GRADE,  lo)
+                    if hi: _backfill(df, idx, OUT_HIGH_GRADE, hi)
                     continue
 
                 print(f"[INFO] No exact match for row {idx+2} in '{sheet}': "
-                      f"School='{norm(school)}', District='{norm(district)}'")
+                      f"{OUT_SCHOOL_NAME}='{norm(school)}', {OUT_DISTRICT_NAME}='{norm(district)}'")
 
-                # ---- Online lookup by name (not writing Grades to workbook)
+                # ---- Online lookup by name
                 web_row = edna_lookup_by_name(norm(school), norm(district), delay_sec=0.6)
                 if web_row and (web_row.get("NCES 12-digit (District+Branch)") or web_row.get("NCES Code")):
                     code12 = _digits_only(web_row.get("NCES 12-digit (District+Branch)", "")) or _digits_only(web_row.get("NCES Code", ""))
-                    dist7  = _digits_only(web_row.get("District NCES", "")) or _derive_district7_from_12(code12)
-                    df.at[idx, "School Number (NCES)"]   = code12
-                    df.at[idx, "District Number (NCES)"] = dist7
+                    dist7  = _digits_only(web_row.get("District NCES", "")) or code12[:7]
+                    df.at[idx, OUT_SCHOOL_NCES]   = code12
+                    df.at[idx, OUT_DISTRICT_NCES] = dist7
 
-                    # Compute min/max from Grades (sheet preferred, else web)
                     grades_text = grades_text_in_sheet or web_row.get("Grades", "") or ""
                     tokens = _parse_grade_tokens(grades_text)
                     lo, hi = _lowest_highest_from_tokens(tokens)
-                    if lo: df.at[idx, "Lowest Grade Level Served"] = lo
-                    if hi: df.at[idx, "Highest Grade Level Served"] = hi
+                    if lo: _backfill(df, idx, OUT_LOW_GRADE,  lo)
+                    if hi: _backfill(df, idx, OUT_HIGH_GRADE, hi)
 
                     try:
                         _append_if_new(web_row)
@@ -902,7 +901,7 @@ def main():
                         traceback.print_exc()
                     continue
 
-                # ---- Fallback by LOCATION_ID
+                # ---- Fallback by LOCATION_ID (common variants)
                 loc_candidates = [
                     row.get("LOCATION_ID", ""),
                     row.get("Location ID", ""),
@@ -914,20 +913,19 @@ def main():
                 loc_raw = next((str(x) for x in loc_candidates if norm(x)), "")
                 loc_digits = _digits_only(loc_raw)
                 if loc_digits:
-                    print(f"[INFO] Attempting location_id lookup for row {idx+2} "
-                          f"in '{sheet}' using SchoolBranch={loc_digits.zfill(4)}")
+                    print(f"[INFO] Attempting location_id lookup for row {idx+2} in '{sheet}' using SchoolBranch={loc_digits.zfill(4)}")
                     web_row_loc = edna_lookup_by_location_id(loc_digits, delay_sec=0.6)
                     if web_row_loc and (web_row_loc.get("NCES 12-digit (District+Branch)") or web_row_loc.get("NCES Code")):
                         code12 = _digits_only(web_row_loc.get("NCES 12-digit (District+Branch)", "")) or _digits_only(web_row_loc.get("NCES Code", ""))
-                        dist7  = _digits_only(web_row_loc.get("District NCES", "")) or _derive_district7_from_12(code12)
-                        df.at[idx, "School Number (NCES)"]   = code12
-                        df.at[idx, "District Number (NCES)"] = dist7
+                        dist7  = _digits_only(web_row_loc.get("District NCES", "")) or code12[:7]
+                        df.at[idx, OUT_SCHOOL_NCES]   = code12
+                        df.at[idx, OUT_DISTRICT_NCES] = dist7
 
                         grades_text = grades_text_in_sheet or web_row_loc.get("Grades", "") or ""
                         tokens = _parse_grade_tokens(grades_text)
                         lo, hi = _lowest_highest_from_tokens(tokens)
-                        if lo: df.at[idx, "Lowest Grade Level Served"] = lo
-                        if hi: df.at[idx, "Highest Grade Level Served"] = hi
+                        if lo: _backfill(df, idx, OUT_LOW_GRADE,  lo)
+                        if hi: _backfill(df, idx, OUT_HIGH_GRADE, hi)
 
                         try:
                             _append_if_new(web_row_loc)
@@ -942,46 +940,35 @@ def main():
                     best_match, score = _extract_one(key, csv_keys)
                     if best_match and score >= FUZZY_THRESHOLD:
                         code12 = pair_to_nces12.get(best_match, "")
-                        df.at[idx, "School Number (NCES)"]   = code12
-                        df.at[idx, "District Number (NCES)"] = pair_to_dist7.get(best_match, "") or _derive_district7_from_12(code12)
+                        df.at[idx, OUT_SCHOOL_NCES]   = code12
+                        df.at[idx, OUT_DISTRICT_NCES] = pair_to_dist7.get(best_match, "") or code12[:7]
                         grades_text = grades_text_in_sheet or pair_to_grades.get(best_match, "")
                         tokens = _parse_grade_tokens(grades_text)
                         lo, hi = _lowest_highest_from_tokens(tokens)
-                        if lo: df.at[idx, "Lowest Grade Level Served"] = lo
-                        if hi: df.at[idx, "Highest Grade Level Served"] = hi
+                        if lo: _backfill(df, idx, OUT_LOW_GRADE,  lo)
+                        if hi: _backfill(df, idx, OUT_HIGH_GRADE, hi)
                         print(f"[FUZZY] Using fuzzy match (score {score:.1f}) → {best_match}")
                         continue
 
                 print(f"[WARN] No match found for row {idx+2} in '{sheet}': "
-                      f"School='{norm(school)}', District='{norm(district)}'")
+                      f"{OUT_SCHOOL_NAME}='{norm(school)}', {OUT_DISTRICT_NAME}='{norm(district)}'")
 
-            # 5) Write NCES + Lowest/Highest back to THIS sheet now
+            # ---- Write back to THIS sheet now (respect configured headers) ----
             ws = wb[sheet]
             header_to_col = build_header_map(ws)
 
-            if "School Number (NCES)" not in header_to_col:
-                col_idx = len(header_to_col) + 1
-                ws.cell(row=1, column=col_idx, value="School Number (NCES)")
-                header_to_col["School Number (NCES)"] = col_idx
-            if "District Number (NCES)" not in header_to_col:
-                col_idx = len(header_to_col) + 1
-                ws.cell(row=1, column=col_idx, value="District Number (NCES)")
-                header_to_col["District Number (NCES)"] = col_idx
-            # Ensure Lowest/Highest columns on BOTH sheets
-            if "Lowest Grade Level Served" not in header_to_col:
-                col_idx = len(header_to_col) + 1
-                ws.cell(row=1, column=col_idx, value="Lowest Grade Level Served")
-                header_to_col["Lowest Grade Level Served"] = col_idx
-            if "Highest Grade Level Served" not in header_to_col:
-                col_idx = len(header_to_col) + 1
-                ws.cell(row=1, column=col_idx, value="Highest Grade Level Served")
-                header_to_col["Highest Grade Level Served"] = col_idx
+            # Ensure headers exist in the sheet; create if absent.
+            for header in (OUT_SCHOOL_NCES, OUT_DISTRICT_NCES, OUT_LOW_GRADE, OUT_HIGH_GRADE):
+                if header not in header_to_col:
+                    col_idx = len(header_to_col) + 1
+                    ws.cell(row=1, column=col_idx, value=header)
+                    header_to_col[header] = col_idx
 
             # Column indices
-            nces_school_col   = header_to_col["School Number (NCES)"]
-            nces_district_col = header_to_col["District Number (NCES)"]
-            low_col = header_to_col["Lowest Grade Level Served"]
-            high_col = header_to_col["Highest Grade Level Served"]
+            nces_school_col   = header_to_col[OUT_SCHOOL_NCES]
+            nces_district_col = header_to_col[OUT_DISTRICT_NCES]
+            low_col           = header_to_col[OUT_LOW_GRADE]
+            high_col          = header_to_col[OUT_HIGH_GRADE]
 
             # Force text for NCES columns
             for col_idx in (nces_school_col, nces_district_col):
@@ -991,10 +978,10 @@ def main():
             # Write values
             for r in tqdm(range(len(df)), total=len(df), desc=f"Writing outputs in {sheet}", leave=False):
                 excel_row = r + 2
-                ws.cell(row=excel_row, column=nces_school_col,   value=df.iloc[r]["School Number (NCES)"])
-                ws.cell(row=excel_row, column=nces_district_col, value=df.iloc[r]["District Number (NCES)"])
-                ws.cell(row=excel_row, column=low_col,           value=df.iloc[r]["Lowest Grade Level Served"])
-                ws.cell(row=excel_row, column=high_col,          value=df.iloc[r]["Highest Grade Level Served"])
+                ws.cell(row=excel_row, column=nces_school_col,   value=df.iloc[r][OUT_SCHOOL_NCES])
+                ws.cell(row=excel_row, column=nces_district_col, value=df.iloc[r][OUT_DISTRICT_NCES])
+                ws.cell(row=excel_row, column=low_col,           value=df.iloc[r][OUT_LOW_GRADE])
+                ws.cell(row=excel_row, column=high_col,          value=df.iloc[r][OUT_HIGH_GRADE])
 
         out_name = OUTPUT_FILENAME
         wb.save(out_name)

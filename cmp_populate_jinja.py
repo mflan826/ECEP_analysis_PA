@@ -19,26 +19,35 @@ except Exception as e:
     traceback.print_exc()
     raise
 
-school_year_dash = config['years']
+# Years / files
+school_year_dash  = config['years']
 school_year_splat = [yr.replace('-', '_') for yr in school_year_dash]
-file_path_prefix = config['file_path_prefix']
-cmp_output_file = f"{file_path_prefix}/{config['cmp_output_file_name']}"
-db_file = f"{file_path_prefix}/{config['db_file_name']}"
+file_path_prefix  = config['file_path_prefix']
+cmp_output_file   = f"{file_path_prefix}/{config['cmp_output_file_name']}"
+db_file           = f"{file_path_prefix}/{config['db_file_name']}"
 
-# ELSI fields from config
-elsi_school_id_col = config.get('elsi_school_id_col')
-elsi_district_id_col = config.get('elsi_district_id_col')
-elsi_low_grade_band = config.get('elsi_low_grade_band', 'Lowest Grade Level Served')
-elsi_high_grade_band = config.get('elsi_high_grade_band', 'Highest Grade Level Served')
+# -------- Output column names (what you want in the Excel workbook) --------
+OUT_SCHOOL_NAME  = config.get('output_school_name_col',  'School Name')
+OUT_DISTRICT_NAME= config.get('output_district_name_col','District Name')
+OUT_SCHOOL_NCES  = config.get('output_school_id_col',    'School Number (NCES)')
+OUT_DISTRICT_NCES= config.get('output_district_id_col',  'District Number (NCES)')
+OUT_LOW_GRADE    = config.get('output_low_grade_band_col','Lowest Grade Level Served')
+OUT_HIGH_GRADE   = config.get('output_high_grade_band_col','Highest Grade Level Served')
+
+# -------- ELSI *source* column names (as they appear in your data/sql joins) --------
+ELSI_SCHOOL_ID   = config.get('elsi_school_id_col')       
+ELSI_DISTRICT_ID = config.get('elsi_district_id_col')      
+ELSI_LOW_GRADE   = config.get('elsi_low_grade_band',  OUT_LOW_GRADE)
+ELSI_HIGH_GRADE  = config.get('elsi_high_grade_band', OUT_HIGH_GRADE)
 
 # =========================
-# Schemas
+# Schemas (built from configured output names)
 # =========================
 SCHEMA_CS = [
     "School Year",
-    "School Number (NCES)", "School Number (State)",
-    "District Number (NCES)", "District Number (State)",
-    "Lowest Grade Level Served", "Highest Grade Level Served",
+    OUT_SCHOOL_NCES, f"{OUT_SCHOOL_NAME} (State)" if OUT_SCHOOL_NAME else "School Number (State)",
+    OUT_DISTRICT_NCES, f"{OUT_DISTRICT_NAME} (State)" if OUT_DISTRICT_NAME else "District Number (State)",
+    OUT_LOW_GRADE, OUT_HIGH_GRADE,
     "Category",
     "Basic_Courses", "Basic_Total",
     "Adv_Courses", "Adv_Total"
@@ -46,9 +55,9 @@ SCHEMA_CS = [
 
 SCHEMA_POP = [
     "School Year",
-    "School Number (NCES)", "School Number (State)",
-    "District Number (NCES)", "District Number (State)",
-    "Lowest Grade Level Served", "Highest Grade Level Served",
+    OUT_SCHOOL_NCES, f"{OUT_SCHOOL_NAME} (State)" if OUT_SCHOOL_NAME else "School Number (State)",
+    OUT_DISTRICT_NCES, f"{OUT_DISTRICT_NAME} (State)" if OUT_DISTRICT_NAME else "District Number (State)",
+    OUT_LOW_GRADE, OUT_HIGH_GRADE,
     "Girls", "Boys", "Gender X", "Total"
 ]
 
@@ -66,15 +75,17 @@ def _ensure_parent_dir(path: str):
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
 
+def _first_present(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c and c in df.columns:
+            return c
+    return None
+
 def _parse_grade_band_from_grades_column(df: pd.DataFrame, grades_col: str = 'Grades') -> tuple[pd.Series, pd.Series]:
     """
-    Derive Lowest/Highest Grade Level Served from a comma-separated 'Grades' column.
-    e.g., '1,2,3,4,5' -> (1, 5)
-    Non-numeric tokens are ignored. Empty -> <NA>.
-    Returns (lowest_series, highest_series) aligned to df.index.
+    Derive Lowest/Highest grade from a comma-separated 'Grades' column.
+    e.g., '1,2,3,4,5' -> (1, 5). Non-numeric tokens ignored. Empty -> <NA>.
     """
-    import numpy as np
-
     lowest = pd.Series(pd.NA, index=df.index, dtype='Int64')
     highest = pd.Series(pd.NA, index=df.index, dtype='Int64')
 
@@ -84,7 +95,6 @@ def _parse_grade_band_from_grades_column(df: pd.DataFrame, grades_col: str = 'Gr
     def parse_one(val):
         if pd.isna(val):
             return (pd.NA, pd.NA)
-        # Accept strings like "1, 2, 3" or already-iterables
         if isinstance(val, str):
             tokens = [t.strip() for t in val.split(',')]
         elif isinstance(val, (list, tuple)):
@@ -94,7 +104,6 @@ def _parse_grade_band_from_grades_column(df: pd.DataFrame, grades_col: str = 'Gr
 
         nums = []
         for t in tokens:
-            # keep only integers found; ignore PK/KG/etc. unless they’re digits
             if isinstance(t, str) and t.isdigit():
                 nums.append(int(t))
             elif isinstance(t, (int, float)) and not pd.isna(t):
@@ -103,7 +112,7 @@ def _parse_grade_band_from_grades_column(df: pd.DataFrame, grades_col: str = 'Gr
                 except Exception:
                     pass
 
-        if len(nums) == 0:
+        if not nums:
             return (pd.NA, pd.NA)
         return (min(nums), max(nums))
 
@@ -123,9 +132,6 @@ def init_workbook(filepath: str,
                   overwrite: bool = True):
     """
     Create (or overwrite) an .xlsx workbook with specified sheets and headers.
-    - Freezes panes under the header row.
-    - Applies an AutoFilter to the header row.
-    - Writes headers exactly as provided, in order.
     """
     _ensure_parent_dir(filepath)
     if overwrite and os.path.exists(filepath):
@@ -155,23 +161,27 @@ def init_workbook(filepath: str,
     wb.save(filepath)
 
 # =========================
-# Normalizers
+# Normalizers (config-aware)
 # =========================
 def normalize_school_pop_df(df: pd.DataFrame, school_year_value: str) -> pd.DataFrame:
     try:
         df = df.copy()
         df['School Year'] = school_year_value
 
-        # Mirror NCES -> State
-        if 'School Number (NCES)' in df.columns:
-            df['School Number (State)'] = df['School Number (NCES)']
-        elif 'School Number (State)' not in df.columns:
-            df['School Number (State)'] = pd.NA
+        # ---- Mirror NCES -> "State" ID placeholders (writer expects columns present) ----
+        # Output ID columns
+        if OUT_SCHOOL_NCES in df.columns:
+            # Create a placeholder "state" column to satisfy schema; it will mirror NCES
+            df[f"{OUT_SCHOOL_NAME} (State)"] = df[OUT_SCHOOL_NCES]
+        else:
+            if f"{OUT_SCHOOL_NAME} (State)" not in df.columns:
+                df[f"{OUT_SCHOOL_NAME} (State)"] = pd.NA
 
-        if 'District Number (NCES)' in df.columns:
-            df['District Number (State)'] = df['District Number (NCES)']
-        elif 'District Number (State)' not in df.columns:
-            df['District Number (State)'] = pd.NA
+        if OUT_DISTRICT_NCES in df.columns:
+            df[f"{OUT_DISTRICT_NAME} (State)"] = df[OUT_DISTRICT_NCES]
+        else:
+            if f"{OUT_DISTRICT_NAME} (State)" not in df.columns:
+                df[f"{OUT_DISTRICT_NAME} (State)"] = pd.NA
 
         # Robust numeric helper
         def _num(col: str) -> pd.Series:
@@ -179,22 +189,41 @@ def normalize_school_pop_df(df: pd.DataFrame, school_year_value: str) -> pd.Data
                 return pd.to_numeric(df[col], errors='coerce').fillna(0)
             return pd.Series(0, index=df.index, dtype='float64')
 
-        total = _num('Girls') + _num('Boys') + _num('Gender X')
-        df['Total'] = total.round().astype('Int64')
+        # Compute Total if not present
+        if 'Total' not in df.columns:
+            total = _num('Girls') + _num('Boys') + _num('Gender X')
+            df['Total'] = total.round().astype('Int64')
 
-        # If pop query already has explicit low/high, keep them; otherwise derive from Grades if present
-        need_low = ('Lowest Grade Level Served' not in df.columns) or df['Lowest Grade Level Served'].isna().all()
-        need_high = ('Highest Grade Level Served' not in df.columns) or df['Highest Grade Level Served'].isna().all()
+        # --- Populate grade bands into OUTPUT columns ---
+        # Prefer explicit *ELSI source* columns, else any pre-existing OUTPUT columns, else derive from Grades.
+        low_src  = _first_present(df, [ELSI_LOW_GRADE, OUT_LOW_GRADE])
+        high_src = _first_present(df, [ELSI_HIGH_GRADE, OUT_HIGH_GRADE])
+
+        if low_src and low_src != OUT_LOW_GRADE:
+            df[OUT_LOW_GRADE] = df[low_src]
+        elif OUT_LOW_GRADE not in df.columns:
+            df[OUT_LOW_GRADE] = pd.NA
+
+        if high_src and high_src != OUT_HIGH_GRADE:
+            df[OUT_HIGH_GRADE] = df[high_src]
+        elif OUT_HIGH_GRADE not in df.columns:
+            df[OUT_HIGH_GRADE] = pd.NA
+
+        # If still blank, try deriving from Grades
+        need_low = df[OUT_LOW_GRADE].isna().all() if OUT_LOW_GRADE in df.columns else True
+        need_high = df[OUT_HIGH_GRADE].isna().all() if OUT_HIGH_GRADE in df.columns else True
         if need_low or need_high:
-            low_s, high_s = _parse_grade_band_from_grades_column(df, grades_col='Grades' if 'Grades' in df.columns else 'grades')
-            if 'Lowest Grade Level Served' not in df.columns:
-                df['Lowest Grade Level Served'] = low_s
-            else:
-                df['Lowest Grade Level Served'] = df['Lowest Grade Level Served'].fillna(low_s)
-            if 'Highest Grade Level Served' not in df.columns:
-                df['Highest Grade Level Served'] = high_s
-            else:
-                df['Highest Grade Level Served'] = df['Highest Grade Level Served'].fillna(high_s)
+            grades_col = 'Grades' if 'Grades' in df.columns else ('grades' if 'grades' in df.columns else None)
+            if grades_col is not None:
+                low_s, high_s = _parse_grade_band_from_grades_column(df, grades_col=grades_col)
+                if OUT_LOW_GRADE in df.columns:
+                    df[OUT_LOW_GRADE] = df[OUT_LOW_GRADE].fillna(low_s)
+                else:
+                    df[OUT_LOW_GRADE] = low_s
+                if OUT_HIGH_GRADE in df.columns:
+                    df[OUT_HIGH_GRADE] = df[OUT_HIGH_GRADE].fillna(high_s)
+                else:
+                    df[OUT_HIGH_GRADE] = high_s
 
         return df
     except Exception as e:
@@ -205,58 +234,54 @@ def normalize_school_pop_df(df: pd.DataFrame, school_year_value: str) -> pd.Data
 def normalize_school_cs_df(df: pd.DataFrame, school_year_value: str) -> pd.DataFrame:
     """
     Ensures School CS rows have standardized IDs, filters out zero-only course rows,
-    and populates grade-band columns from:
-      1) ELSI-configured columns OR canonical SQL aliases, if present; else
-      2) a comma-separated 'Grades' column (min/max numeric).
+    and populates OUTPUT grade-band columns using config-aware sources.
     """
     try:
         df = df.copy()
         df['School Year'] = school_year_value
 
-        # Ensure ID columns exist; mirror NCES -> State to avoid blanks
-        for col in ['School Number (NCES)', 'District Number (NCES)',
-                    'School Number (State)', 'District Number (State)']:
+        # Ensure OUTPUT ID columns exist; mirror to the "(State)" placeholders
+        for col in [OUT_SCHOOL_NCES, OUT_DISTRICT_NCES, f"{OUT_SCHOOL_NAME} (State)", f"{OUT_DISTRICT_NAME} (State)"]:
             if col not in df.columns:
                 df[col] = pd.NA
-        if 'School Number (NCES)' in df.columns:
-            df['School Number (State)'] = df['School Number (NCES)']
-        if 'District Number (NCES)' in df.columns:
-            df['District Number (State)'] = df['District Number (NCES)']
+        if OUT_SCHOOL_NCES in df.columns:
+            df[f"{OUT_SCHOOL_NAME} (State)"] = df[OUT_SCHOOL_NCES]
+        if OUT_DISTRICT_NCES in df.columns:
+            df[f"{OUT_DISTRICT_NAME} (State)"] = df[OUT_DISTRICT_NCES]
 
+        # Category presence
         if 'Category' not in df.columns:
             df['Category'] = pd.NA
 
-        # ---- Robust grade-band population ----
-        def _first_present(cols: list[str]) -> str | None:
-            for c in cols:
-                if c in df.columns:
-                    return c
-            return None
+        # --- Populate grade bands into OUTPUT columns (prefer ELSI source names) ---
+        low_src  = _first_present(df, [ELSI_LOW_GRADE, OUT_LOW_GRADE])
+        high_src = _first_present(df, [ELSI_HIGH_GRADE, OUT_HIGH_GRADE])
 
-        # Accept either YAML-configured names OR the canonical aliases from your SQL
-        low_src  = _first_present([elsi_low_grade_band,  'Lowest Grade Level Served'])
-        high_src = _first_present([elsi_high_grade_band, 'Highest Grade Level Served'])
+        if low_src and low_src != OUT_LOW_GRADE:
+            df[OUT_LOW_GRADE] = df[low_src]
+        elif OUT_LOW_GRADE not in df.columns:
+            df[OUT_LOW_GRADE] = pd.NA
 
-        if low_src is not None:
-            df['Lowest Grade Level Served'] = df[low_src]
-        else:
-            df['Lowest Grade Level Served'] = pd.NA
+        if high_src and high_src != OUT_HIGH_GRADE:
+            df[OUT_HIGH_GRADE] = df[high_src]
+        elif OUT_HIGH_GRADE not in df.columns:
+            df[OUT_HIGH_GRADE] = pd.NA
 
-        if high_src is not None:
-            df['Highest Grade Level Served'] = df[high_src]
-        else:
-            df['Highest Grade Level Served'] = pd.NA
-
-        # If still entirely NA, try deriving from 'Grades' if present
-        need_low = df['Lowest Grade Level Served'].isna().all()
-        need_high = df['Highest Grade Level Served'].isna().all()
+        # Fallback: derive from Grades
+        need_low = df[OUT_LOW_GRADE].isna().all() if OUT_LOW_GRADE in df.columns else True
+        need_high = df[OUT_HIGH_GRADE].isna().all() if OUT_HIGH_GRADE in df.columns else True
         if need_low or need_high:
             grades_col = 'Grades' if 'Grades' in df.columns else ('grades' if 'grades' in df.columns else None)
             if grades_col is not None:
                 low_s, high_s = _parse_grade_band_from_grades_column(df, grades_col=grades_col)
-                df['Lowest Grade Level Served'] = df['Lowest Grade Level Served'].fillna(low_s)
-                df['Highest Grade Level Served'] = df['Highest Grade Level Served'].fillna(high_s)
-        # --------------------------------------
+                if OUT_LOW_GRADE in df.columns:
+                    df[OUT_LOW_GRADE] = df[OUT_LOW_GRADE].fillna(low_s)
+                else:
+                    df[OUT_LOW_GRADE] = low_s
+                if OUT_HIGH_GRADE in df.columns:
+                    df[OUT_HIGH_GRADE] = df[OUT_HIGH_GRADE].fillna(high_s)
+                else:
+                    df[OUT_HIGH_GRADE] = high_s
 
         # Filter out rows where all CS counts are zero
         def _num(col: str) -> pd.Series:
@@ -290,10 +315,6 @@ def write_dataframes_to_excel(filepath: str,
                               declared_headers: list[str] | None = None):
     """
     Write multiple DataFrames into an existing sheet, clearing previous data rows.
-    - Uses the sheet's header row (created by init_workbook) as the source of truth.
-    - If DataFrames contain columns that are not in the header, they are appended
-      to the right and written thereafter.
-    - All writes use exact column positions—no shifting.
     """
     def escape_for_excel(val):
         if pd.isnull(val):
@@ -366,7 +387,6 @@ def write_dataframes_to_excel(filepath: str,
 
         # Write rows from all DataFrames
         r = start_row
-        # Progress bar over all rows across all dataframes
         total_rows = sum(len(df) for df in (dataframes or []))
         row_progress = tqdm(total=total_rows, desc=f"Writing rows to '{sheet_name}'", unit="row")
 
@@ -463,7 +483,7 @@ def main():
             print(f"[sqlite close] {e}")
             traceback.print_exc()
 
-    # Initialize workbook
+    # Initialize workbook with configured headers
     try:
         init_workbook(
             cmp_output_file,
